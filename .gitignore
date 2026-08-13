@@ -1,0 +1,10 @@
+.gradle/
+build/
+*.class
+.p2p-chat-data*
+*.sqlite
+*.b64
+*.log
+.idea/
+*.iml
+
