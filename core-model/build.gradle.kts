@@ -11,5 +11,13 @@ plugins {
 // an accidental integration point that couples unrelated concerns together. See
 // docs/architecture-spec.md §4 (domain model) — PeerId/DeviceId were already specified there
 // as plain records before any module needed them enough to justify actually scaffolding this.
-//
-// Added in M3d. See the M3d section of README.md for what this module does and does not fix.
+
+dependencies {
+    testImplementation(platform("org.junit:junit-bom:5.10.2"))
+    testImplementation("org.junit.jupiter:junit-jupiter")
+    testImplementation("org.assertj:assertj-core:3.26.0")
+}
+
+tasks.test {
+    useJUnitPlatform()
+}
