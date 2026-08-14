@@ -2,9 +2,15 @@
 build/
 *.class
 .p2p-chat-data*
+.*-data*/
 *.sqlite
+*.db
+*.key
+*.meta
+*.pub
 *.b64
 *.log
 .idea/
 *.iml
-
+test-transfer-file.txt
+m4c-test-file.txt

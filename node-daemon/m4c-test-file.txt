@@ -1,3 +1,0 @@
-Hello from M4c End-to-End Encrypted File Transfer!
-This file is being sent chunked over a real libp2p connection using Signal PQXDH and Double Ratchet sessions.
-Testing bidirectional request-response and whole-file SHA-256 integrity verification.

@@ -1,4 +1,0 @@
-This is a test file for P2P end-to-end encrypted resumable file transfer verification.
-It contains enough text to split across multiple 16-byte chunks!
-Line 3: 0123456789ABCDEF
-Line 4: Testing M4c and M4d resume logic.
