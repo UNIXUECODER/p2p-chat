@@ -55,7 +55,7 @@ p2p-chat/
 ├── core-network/                     # jvm-libp2p integration: transport, Envelope/Relay/Discovery protocols
 ├── core-storage/                     # M3d: SQLite persistence layer, migrations (schema in §9)
 ├── core-filetransfer/                # M4a/M4b: chunking, per-chunk AES-256-GCM encryption, wire payload codecs (swarm transfer deferred — see §12, M8)
-├── core-messaging/                   # M5a: HybridLogicalClock. M5b: chat wire payloads + codec. M5c: ChatListenerMain/ChatSenderMain in node-daemon, real bidirectional 1:1 chat (dedup, receipt state transitions land in M5d)
+├── core-messaging/                   # M5a: HybridLogicalClock. M5b: chat wire payloads + codec. M5c: ChatListenerMain/ChatSenderMain in node-daemon, real bidirectional 1:1 chat. M5d: dedup + receipt state transitions. M5e: HLC remote-drift guard
 ├── node-daemon/                      # composition root — wires core-* modules, milestone demo entry points
 ├── relay-server/                     # standalone deployable relay + discovery node (headless, anyone can run one)
 └── docs/
@@ -533,6 +533,8 @@ Migrations are managed with a versioned-script runner (`V001__init.sql`, `V002__
 - **Connectivity status is always surfaced.** `ConnectivityStatus` (DIRECT / RELAYED / UNREACHABLE) is returned by `ConnectionStrategy.send()` and will be exposed through `PeerNetworkService.connectivityStatus()` per peer once the full daemon is wired. The UI must show this — "connecting..." / "relayed" states map directly onto it.
 - **Self-address discovery is still an open gap, found by M5c.** `network.listenAddresses()` can return a wildcard bind address (observed: `/ip6/::/tcp/<port>/...` on Windows) rather than a concrete, dialable one — not a problem this section's design anticipated. M5c's `ChatListenerMain`/`ChatSenderMain` resolve this to loopback, which is correct only because that milestone's demo runs both processes on one machine; it is explicitly not a fix for two different physical machines (see `firstDialableAddress`'s own Javadoc). Real self-address discovery — a real LAN IP, or STUN-style external address discovery — is unbuilt and unresolved; worth resolving properly before M6/M7 need peers on different machines to actually reach each other.
 
+> **Amendment (M5d):** the same-machine limitation above is now narrower, though the underlying gap this bullet describes is not closed. `firstDialableAddress` was promoted to `core-network`'s `DialableAddressResolver` and now performs real local network-interface enumeration, resolving a wildcard bind to this machine's actual LAN IP rather than always loopback — same-LAN two-machine chat/file transfer should now work without manual address substitution. Still explicitly unsolved: (1) reachability across different networks/NAT — `ConnectionStrategy`'s direct-first/relay-fallback logic (below) is proven in isolation but not yet wired into the chat/file send paths, which still call `sendEnvelope` directly; and (2) real external/public address discovery (STUN or similar) for a node with no usable LAN address, which remains fully unbuilt. Both are explicitly scoped to M6 — see the M5d section of README.md.
+
 ---
 
 ## 11. Group messaging & CRDT design
@@ -642,20 +644,24 @@ Concrete failure modes to design against now, not discover later:
 
     **Milestone reordering from here (see README.md for the full rationale):** the original plan bundled "group chat" and "Electron UI" into single M5/M6 milestones. `core-messaging` and `core-groups` were always two separate modules per §3 — the old table just hadn't split them. Group chat (M8) is now deliberately sequenced *after* a working 1:1 product (M5–M7) rather than right after file transfer: it's the hardest, least-proven remaining piece (no HLC implementation exists anywhere yet despite being referenced throughout this document, and OR-Set CRDT merge semantics aren't something to hand-trace with confidence the way M1–M4 were), and it lands additively on top of M5's work regardless — `conversations.type` is already `DIRECT | GROUP`, `conversations.createGroup` is already in the §7 RPC table, `GROUP_OP` is already a numbered `EnvelopeType` (§6), and sender-key group encryption rides on top of the pairwise Double Ratchet sessions M2/M5 already establish rather than replacing them.
 
-16. **M5** 🚧 — 1:1 messaging (`core-messaging`, new module): real send/receive replacing the hardcoded demo strings every prior milestone has used, delivery/read receipts, HLC-based ordering, message-id dedup. First real caller of `saveMessage`/`saveConversation`.
+16. **M5** ✅ — 1:1 messaging (`core-messaging`, new module): real send/receive replacing the hardcoded demo strings every prior milestone has used, delivery/read receipts, HLC-based ordering, message-id dedup. First real caller of `saveMessage`/`saveConversation`.
     - **M5a** ✅ — `HlcTimestamp` + `HybridLogicalClock`, proven in isolation. See the M5a section of README.md and the correction above (§11) — the "use an existing implementation" line didn't survive contact with an actual search for one.
     - **M5b** ✅ — Chat wire payloads (`ChatMessagePayload`, plus `DeliveryReceiptPayload`/`ReadReceiptPayload`, filling a §6 gap of the same shape M4b found for `FileChunkRequestPayload`), proven in isolation. See the M5b section of README.md.
     - **M5c** ✅ (verified on real hardware — two real bugs found and fixed: a wildcard-bind-address issue, and a Netty event-loop deadlock now documented directly in `PeerNetworkService`'s own Javadoc) — Wired between two real peers: real bidirectional 1:1 chat over `SecureSessionService`, persisted via `saveConversation`/`saveMessage`. `ChatListenerMain`/`ChatSenderMain` depend on `core-network`/`core-crypto` (jvm-libp2p, libsignal-client), unreachable in this sandbox — same constraint M0–M4c originally had. See the M5c section of README.md, including the `senderAddress` correction to M5b found while designing this.
-    - **M5d** 🔜 — Message-id dedup on receive + delivery/read receipt state transitions in storage.
+    - **M5d** ✅ (verified on real hardware) — Message-id dedup on receive + delivery/read receipt state transitions in storage. `StorageService` gained `hasMessage`/`updateDeliveryState`/`markMessagesReadUpTo`; `ChatListenerMain`/`ChatSenderMain` check the first before persisting, send the latter two automatically (delivery) or on an opt-in `markread` flag (read, simulating a real UI action that doesn't exist until M7). See the M5d section of README.md.
 
-17. **M6** 🔜 — `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope. First long-running process holding multiple simultaneous peer sessions — everything through M5 is one-shot CLI demos. Also where M3c's discovery replaces manually hand-carrying a bundle file/multiaddr between terminals.
+    **M5 complete, M5a through M5d.**
 
-18. **M7** 🔜 — Electron frontend wired against the API — 1:1 chat + file transfer UI.
+17. **M5e** ✅ (verified on real hardware) — Pre-M6 cleanup pass, from a peer-authored checklist reviewed against the actual source before acting on it. Four real, checkable items: (1) the same Netty-event-loop deadlock M5c found in chat, present and fixed identically in `FileReceiverMain`/`FileSenderMain`'s callback-triggered sends, never backported since M4c predates that discovery; (2) unknown-marker validation and length-prefix bounds checks audited and hardened across all 6 wire codecs in the project, not just the 2 originally flagged — `EncryptedFrameCodec`/`RelayFrameCodec` had the actual silent-misdecode bug, the rest were missing allocation bounds checks; (3) `HybridLogicalClock.checkDrift`, a strictly additive opt-in guard against an implausibly-future remote timestamp — closes a gap that class's own Javadoc had flagged as deferred since M5a, without touching `update`'s own algorithm at all; (4) a permanent `-Pduplicatesend` test flag proving M5d's dedup path live, not just via its storage-layer unit test. A larger set of M6-scoped design questions (canonical peer identity, shared chat/file dispatch, one outbound send path, discovery record shape, pre-key bundle lifecycle, storage transaction boundaries, a daemon error vocabulary) were deliberately identified and left open rather than answered here — see "Open M6 design decisions" in README.md.
 
-19. **M8** 🔜 — Group chat: CRDT membership + sender-key group encryption (`core-groups`, new module). See §11.
+18. **M6** 🔜 — `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope. First long-running process holding multiple simultaneous peer sessions — everything through M5e is one-shot CLI demos. Also where M3c's discovery replaces manually hand-carrying a bundle file/multiaddr between terminals.
 
-20. **M9** 🔜 — Packaging/distribution; Android port of the core.
+19. **M7** 🔜 — Electron frontend wired against the API — 1:1 chat + file transfer UI.
 
-21. **Post-MVP** — multi-device linking, voice/video, richer moderation tooling.
+20. **M8** 🔜 — Group chat: CRDT membership + sender-key group encryption (`core-groups`, new module). See §11.
+
+21. **M9** 🔜 — Packaging/distribution; Android port of the core.
+
+22. **Post-MVP** — multi-device linking, voice/video, richer moderation tooling.
 
 Each milestone is independently demoable and does not require revisiting earlier ones — that ordering is deliberate, so "no drastic changes at build time" holds in practice, not just on paper.

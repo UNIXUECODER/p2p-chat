@@ -11,6 +11,11 @@ import java.util.Arrays;
  * from libsignal's internal wire format — keeps this fully within our own
  * control and easy to verify (see the standalone round-trip test that
  * confirmed this exact logic before it was wired into anything else).
+ *
+ * <p><b>Pre-M6 cleanup pass:</b> {@link #decode} previously treated any marker byte other than
+ * {@code 0x01} as {@code 0x02} (Whisper) — {@code wire[0] == PREKEY_MARKER} with no else branch,
+ * so a corrupted or malformed marker byte silently became a wrong-but-plausible decode instead
+ * of a loud failure. Now rejects anything that isn't exactly one of the two defined markers.
  */
 public final class EncryptedFrameCodec {
 
@@ -31,7 +36,14 @@ public final class EncryptedFrameCodec {
         if (wire.length < 1) {
             throw new IllegalArgumentException("Encrypted frame too short: " + wire.length + " bytes");
         }
-        boolean isPreKeyMessage = wire[0] == PREKEY_MARKER;
+        boolean isPreKeyMessage;
+        if (wire[0] == PREKEY_MARKER) {
+            isPreKeyMessage = true;
+        } else if (wire[0] == WHISPER_MARKER) {
+            isPreKeyMessage = false;
+        } else {
+            throw new IllegalArgumentException("Unknown encrypted frame marker: " + wire[0]);
+        }
         byte[] ciphertext = Arrays.copyOfRange(wire, 1, wire.length);
         return new EncryptedFrame(isPreKeyMessage, ciphertext);
     }

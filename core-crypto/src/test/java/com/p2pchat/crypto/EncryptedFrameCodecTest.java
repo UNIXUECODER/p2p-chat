@@ -37,4 +37,16 @@ class EncryptedFrameCodecTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Encrypted frame too short");
     }
+
+    // --- Pre-M6 cleanup pass: decode() used to treat any marker byte other than 0x01 as 0x02
+    // (Whisper) — no else branch at all — so a corrupted or malformed marker silently produced a
+    // wrong-but-plausible decode instead of a loud failure. ---
+
+    @Test
+    void rejectUnknownMarker() {
+        byte[] wire = {(byte) 0x99, 1, 2, 3};
+        assertThatThrownBy(() -> EncryptedFrameCodec.decode(wire))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Unknown encrypted frame marker");
+    }
 }

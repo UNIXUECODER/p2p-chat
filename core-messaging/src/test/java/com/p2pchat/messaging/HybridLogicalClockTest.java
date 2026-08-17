@@ -2,6 +2,7 @@ package com.p2pchat.messaging;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -10,6 +11,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * Each test names the exact branch of Figure 4 (docs/architecture-spec.md §11, and
@@ -260,5 +262,94 @@ class HybridLogicalClockTest {
         for (int i = 0; i < counters.length; i++) {
             assertThat(counters[i]).isEqualTo(i);
         }
+    }
+
+    // --- Pre-M6 cleanup pass: checkDrift, the trust-boundary guard flagged as deferred in this
+    // class's own Javadoc since M5a ("Left for whichever of M5b/M5c first has update fed an
+    // untrusted remote value"). Deliberately a separate opt-in check, not a change to update()
+    // itself — see the Javadoc amendment for why — so these tests never call update() at all. ---
+
+    @Test
+    void checkDriftAcceptsARemoteTimestampWithinTheDefaultBound() {
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(1_000_000L + Duration.ofSeconds(30).toMillis(), 0, "node-b");
+
+        hlc.checkDrift(remote); // must not throw
+    }
+
+    @Test
+    void checkDriftAcceptsARemoteTimestampExactlyAtACustomBoundary() {
+        // drift == max is accepted; only STRICTLY beyond the bound is rejected.
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(1_000_000L + 60_000L, 0, "node-b");
+
+        hlc.checkDrift(remote, Duration.ofSeconds(60)); // must not throw
+    }
+
+    @Test
+    void checkDriftRejectsARemoteTimestampOneMillisecondBeyondTheBound() {
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(1_000_000L + 60_001L, 0, "node-b");
+
+        assertThatThrownBy(() -> hlc.checkDrift(remote, Duration.ofSeconds(60)))
+                .isInstanceOf(HybridLogicalClock.RemoteTimestampRejectedException.class);
+    }
+
+    @Test
+    void checkDriftRejectsARemoteTimestampFarBeyondTheDefaultFiveMinuteBound() {
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(1_000_000L + Duration.ofHours(1).toMillis(), 0, "node-b");
+
+        assertThatThrownBy(() -> hlc.checkDrift(remote))
+                .isInstanceOf(HybridLogicalClock.RemoteTimestampRejectedException.class);
+    }
+
+    @Test
+    void checkDriftRejectionExceptionCarriesTheDetailNeededToLogItClearly() {
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(1_000_000L + 100_000L, 0, "node-b");
+
+        assertThatThrownBy(() -> hlc.checkDrift(remote, Duration.ofSeconds(60)))
+                .isInstanceOf(HybridLogicalClock.RemoteTimestampRejectedException.class)
+                .satisfies(e -> {
+                    HybridLogicalClock.RemoteTimestampRejectedException rejected =
+                            (HybridLogicalClock.RemoteTimestampRejectedException) e;
+                    assertThat(rejected.remotePhysical()).isEqualTo(1_100_000L);
+                    assertThat(rejected.localPhysical()).isEqualTo(1_000_000L);
+                    assertThat(rejected.driftMillis()).isEqualTo(100_000L);
+                    assertThat(rejected.maxDriftMillis()).isEqualTo(60_000L);
+                });
+    }
+
+    @Test
+    void checkDriftNeverRejectsARemoteTimestampInThePast() {
+        // Only the future direction is a trust problem — update()'s own max()-based algorithm
+        // already handles a stale/slow peer correctly. See checkDrift's own Javadoc.
+        MutableTestClock clock = new MutableTestClock(10_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp remote = new HlcTimestamp(0L, 0, "node-b"); // as far in the past as a timestamp can be
+
+        hlc.checkDrift(remote); // must not throw
+    }
+
+    @Test
+    void checkDriftDoesNotMutateClockState() {
+        MutableTestClock clock = new MutableTestClock(1_000_000L);
+        HybridLogicalClock hlc = new HybridLogicalClock("node-a", clock);
+        HlcTimestamp before = hlc.now();
+
+        hlc.checkDrift(new HlcTimestamp(1_000_500L, 0, "node-b")); // within bound, must not throw or mutate
+
+        HlcTimestamp after = hlc.now();
+        // Physical time frozen (clock never advanced) -> if checkDrift left state untouched,
+        // this is a plain counter increment, identical to calling now() twice with nothing
+        // between them.
+        assertThat(after.physical()).isEqualTo(before.physical());
+        assertThat(after.counter()).isEqualTo(before.counter() + 1);
     }
 }

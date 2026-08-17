@@ -23,6 +23,12 @@ import java.io.IOException;
  * every bundle this project creates via PreKeyBundleFactory. libsignal itself
  * allows it to be optional; this codec deliberately does not, to keep this
  * first version simple.
+ *
+ * <p><b>Pre-M6 cleanup pass:</b> found alongside the length-check gap fixed in {@code
+ * RelayFrameCodec} (see that class's own Javadoc) while auditing every length-prefixed decoder in
+ * the project — not itself named in the original checklist, but the identical pattern, so fixed
+ * the same way rather than left inconsistent. {@link #readBytes} now rejects a length the stream
+ * doesn't actually have that many bytes left for.
  */
 public final class PreKeyBundleCodec {
 
@@ -84,6 +90,10 @@ public final class PreKeyBundleCodec {
 
     private static byte[] readBytes(DataInputStream in) throws IOException {
         int length = in.readInt();
+        int available = in.available();
+        if (length < 0 || length > available) {
+            throw new IOException("Malformed length-prefixed field: length=" + length + ", available=" + available);
+        }
         byte[] bytes = new byte[length];
         in.readFully(bytes);
         return bytes;

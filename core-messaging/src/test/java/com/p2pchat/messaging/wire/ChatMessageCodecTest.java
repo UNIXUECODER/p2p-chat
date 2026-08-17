@@ -3,6 +3,7 @@ package com.p2pchat.messaging.wire;
 import com.p2pchat.messaging.HlcTimestamp;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 
@@ -158,5 +159,36 @@ class ChatMessageCodecTest {
         assertThatThrownBy(() -> new ReadReceiptPayload("", HLC))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("conversationId");
+    }
+
+    // --- Pre-M6 cleanup pass: length-prefixed fields (messageId, senderAddress, content, ...)
+    // had no bounds check at all — same gap RelayFrameCodec had (see its own test/Javadoc), fixed
+    // the same way here. Marker validation was already correct (predates this pass). ---
+
+    @Test
+    void rejectOversizedFieldLength() {
+        ByteBuffer buf = ByteBuffer.allocate(5);
+        buf.put((byte) 2); // CHAT_MESSAGE_MARKER
+        buf.putInt(Integer.MAX_VALUE); // messageId's claimed length
+        assertThatThrownBy(() -> ChatMessageCodec.decode(buf.array()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed length-prefixed field");
+    }
+
+    @Test
+    void rejectNegativeFieldLength() {
+        ByteBuffer buf = ByteBuffer.allocate(5);
+        buf.put((byte) 2); // CHAT_MESSAGE_MARKER
+        buf.putInt(-1);
+        assertThatThrownBy(() -> ChatMessageCodec.decode(buf.array()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed length-prefixed field");
+    }
+
+    @Test
+    void rejectEmptyWire() {
+        assertThatThrownBy(() -> ChatMessageCodec.decode(new byte[0]))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Chat message too short");
     }
 }

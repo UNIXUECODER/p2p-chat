@@ -289,13 +289,20 @@ tasks.register<JavaExec>("runChatWireCodecDemo") {
 // pattern.
 tasks.register<JavaExec>("runChatListener") {
     group = "p2p-chat"
-    description = "M5c: listening/replying side. Optional: -Pport=9200 -Pdatadir=.p2p-chat-data " +
-            "-Preply=\"...\" (the automatic reply text sent back to whoever messages this listener)"
+    description = "M5c/M5d: listening/replying side. Optional: -Pport=9200 -Pdatadir=.p2p-chat-data " +
+            "-Preply=\"...\" (the automatic reply text sent back to whoever messages this listener) " +
+            "-Pmarkread=true (also sends a read receipt for each message received, in addition to the automatic delivery receipt)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.ChatListenerMain")
     val portArg = (project.findProperty("port") as String?) ?: "9200"
     val replyArg = project.findProperty("reply") as String?
-    args = if (replyArg != null) {
+    val markreadArg = project.findProperty("markread") as String?
+    // Positional args — if markread (index 2) is supplied, reply (index 1) must be too, even if
+    // just its own default, or listOfNotNull would silently shift markread's value into reply's
+    // slot. Same reasoning FileSenderMain's chunksize/port pairing already documents above.
+    args = if (markreadArg != null) {
+        listOf(portArg, replyArg ?: "Hello back \u2014 this is an M5c automatic reply.", markreadArg)
+    } else if (replyArg != null) {
         listOf(portArg, replyArg)
     } else {
         listOf(portArg)
@@ -305,16 +312,29 @@ tasks.register<JavaExec>("runChatListener") {
 
 tasks.register<JavaExec>("runChatSender") {
     group = "p2p-chat"
-    description = "M5c: sending side. Required: -Paddr=\"...\" -Pbundlefile=\"...\" -Pmessage=\"...\". " +
-            "Optional: -Pport=9201 (this node's own listening port, needed to receive the reply back) -Pdatadir=.p2p-chat-data"
+    description = "M5c/M5d: sending side. Required: -Paddr=\"...\" -Pbundlefile=\"...\" -Pmessage=\"...\". " +
+            "Optional: -Pport=9201 (this node's own listening port, needed to receive the reply back) -Pdatadir=.p2p-chat-data " +
+            "-Pmarkread=true (also sends a read receipt for the listener's reply once received, in addition to the automatic delivery receipt) " +
+            "-Pduplicatesend=true (sends the same messageId a second time, to exercise the listener's dedup path \u2014 pre-M6 cleanup pass)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.ChatSenderMain")
     val addrArg = project.findProperty("addr") as String?
     val bundlefileArg = project.findProperty("bundlefile") as String?
     val messageArg = (project.findProperty("message") as String?) ?: "Hello \u2014 this is an M5c chat test message."
     val portArg = (project.findProperty("port") as String?) ?: "9201"
+    val markreadArg = project.findProperty("markread") as String?
+    val duplicatesendArg = project.findProperty("duplicatesend") as String?
+    // Positional args — if duplicatesend (index 5) is supplied, markread (index 4) must be too,
+    // even if just "false", or listOfNotNull would silently shift duplicatesend's value into
+    // markread's slot. Same reasoning documented on runChatListener/FileSenderMain above.
     if (addrArg != null && bundlefileArg != null) {
-        args = listOf(addrArg, bundlefileArg, messageArg, portArg)
+        args = if (duplicatesendArg != null) {
+            listOf(addrArg, bundlefileArg, messageArg, portArg, markreadArg ?: "false", duplicatesendArg)
+        } else if (markreadArg != null) {
+            listOf(addrArg, bundlefileArg, messageArg, portArg, markreadArg)
+        } else {
+            listOf(addrArg, bundlefileArg, messageArg, portArg)
+        }
     }
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }

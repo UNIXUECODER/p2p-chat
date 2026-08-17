@@ -8,6 +8,16 @@ import java.nio.charset.StandardCharsets;
  * [4 bytes peer-id length][peer-id UTF-8 bytes][remaining bytes: payload].
  * Logic verified standalone (encode/decode round-trip, both message kinds)
  * before being wired into RelayProtocol.
+ *
+ * <p><b>Pre-M6 cleanup pass:</b> {@link #decode} previously accepted any marker byte other than
+ * {@code 0x01} as {@code 0x02} (delivery) — same latent bug {@code EncryptedFrameCodec} had, and
+ * security-relevant here specifically because {@code relay-server} runs this decode against
+ * bytes from arbitrary connecting peers, not just this project's own two ends of a session. Also
+ * previously read the peer-id length prefix with no bounds check at all — {@code new
+ * byte[peerIdLength]} on an adversarial or corrupted length could throw
+ * {@code NegativeArraySizeException} on a negative value or attempt an unbounded allocation on a
+ * huge one. Both fixed: unknown markers are rejected, and any length-prefixed field's length is
+ * checked against the buffer's actual remaining bytes before allocating.
  */
 public final class RelayFrameCodec {
 
@@ -28,13 +38,39 @@ public final class RelayFrameCodec {
     }
 
     public static RelayFrame decode(byte[] wire) {
+        if (wire.length < 1) {
+            throw new IllegalArgumentException("Relay frame too short: " + wire.length + " bytes");
+        }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
-        int peerIdLength = buf.getInt();
-        byte[] peerIdBytes = new byte[peerIdLength];
-        buf.get(peerIdBytes);
+        boolean isForwardRequest;
+        if (marker == FORWARD_MARKER) {
+            isForwardRequest = true;
+        } else if (marker == DELIVER_MARKER) {
+            isForwardRequest = false;
+        } else {
+            throw new IllegalArgumentException("Unknown relay frame marker: " + marker);
+        }
+        byte[] peerIdBytes = getBytes(buf);
         byte[] payload = new byte[buf.remaining()];
         buf.get(payload);
-        return new RelayFrame(marker == FORWARD_MARKER, new String(peerIdBytes, StandardCharsets.UTF_8), payload);
+        return new RelayFrame(isForwardRequest, new String(peerIdBytes, StandardCharsets.UTF_8), payload);
+    }
+
+    /**
+     * Reads a {@code [4-byte length][bytes]} field, rejecting a length that is negative or
+     * exceeds what the buffer actually has left — either signals malformed/truncated/adversarial
+     * input, and both would otherwise reach {@code new byte[length]} directly (see this class's
+     * own Javadoc for why that's a real hazard, not just hygiene).
+     */
+    private static byte[] getBytes(ByteBuffer buf) {
+        int length = buf.getInt();
+        if (length < 0 || length > buf.remaining()) {
+            throw new IllegalArgumentException(
+                    "Malformed length-prefixed field: length=" + length + ", remaining=" + buf.remaining());
+        }
+        byte[] bytes = new byte[length];
+        buf.get(bytes);
+        return bytes;
     }
 }

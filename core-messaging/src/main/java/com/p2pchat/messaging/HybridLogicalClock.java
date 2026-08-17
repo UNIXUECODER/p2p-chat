@@ -1,6 +1,7 @@
 package com.p2pchat.messaging;
 
 import java.time.Clock;
+import java.time.Duration;
 import java.util.Objects;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -46,6 +47,18 @@ import java.util.concurrent.atomic.AtomicReference;
  *   for whichever of M5b/M5c first has {@link #update} fed an untrusted remote value — flagged
  *   here so that milestone doesn't have to rediscover the gap.</li>
  * </ul>
+ *
+ * <p><b>Amendment (pre-M6 cleanup pass):</b> the drift check flagged above as deferred is now
+ * implemented — {@link #checkDrift}, plus {@link RemoteTimestampRejectedException}. Deliberately
+ * NOT folded into {@link #update} itself: {@code update}'s algorithm is exactly Figure 4 of the
+ * paper, transcribed and tested against it, and mixing a trust decision into that method would
+ * make it simultaneously a causality primitive and a policy decision — two different kinds of
+ * correctness that are much easier to reason about, and to test, kept apart. {@code checkDrift}
+ * is a separate, side-effect-free, opt-in check a caller makes before calling {@code update} —
+ * the trust boundary lives in the caller (e.g. {@code ChatListenerMain}/{@code ChatSenderMain}
+ * call it before every {@code update}), not inside the pure algorithm. {@code update} itself is
+ * completely unchanged by this amendment; every test written against it before this pass remains
+ * valid unchanged.
  */
 public final class HybridLogicalClock {
 
@@ -110,5 +123,84 @@ public final class HybridLogicalClock {
             next = new HlcTimestamp(newPhysical, newCounter, nodeId);
         } while (!state.compareAndSet(prev, next));
         return next;
+    }
+
+    /**
+     * A remote timestamp's physical component is too far ahead of this node's own physical clock
+     * to be trusted. Carries enough detail to log the rejection clearly, per the policy this
+     * exists to implement (see {@link HybridLogicalClock#checkDrift}).
+     */
+    public static final class RemoteTimestampRejectedException extends RuntimeException {
+        private final long remotePhysical;
+        private final long localPhysical;
+        private final long driftMillis;
+        private final long maxDriftMillis;
+
+        RemoteTimestampRejectedException(long remotePhysical, long localPhysical, long driftMillis, long maxDriftMillis) {
+            super("remote timestamp " + driftMillis + "ms ahead of local physical time (max allowed "
+                    + maxDriftMillis + "ms) \u2014 remotePhysical=" + remotePhysical + ", localPhysical=" + localPhysical);
+            this.remotePhysical = remotePhysical;
+            this.localPhysical = localPhysical;
+            this.driftMillis = driftMillis;
+            this.maxDriftMillis = maxDriftMillis;
+        }
+
+        public long remotePhysical() {
+            return remotePhysical;
+        }
+
+        public long localPhysical() {
+            return localPhysical;
+        }
+
+        public long driftMillis() {
+            return driftMillis;
+        }
+
+        public long maxDriftMillis() {
+            return maxDriftMillis;
+        }
+    }
+
+    /**
+     * Default policy for {@link #checkDrift} when a caller doesn't supply its own bound. Five
+     * minutes is deliberately generous — real consumer-device clocks can legitimately be off by
+     * more than a few seconds without anything being wrong, and the goal here is catching a
+     * remote timestamp that's implausibly far in the future (an attempt to inflate this node's
+     * clock, or a badly broken peer), not enforcing tight synchronization. This is a policy
+     * default, chosen and documented as such, not a rigorously derived constant — tune it if
+     * real-world testing shows it's wrong in either direction.
+     */
+    public static final Duration DEFAULT_MAX_FUTURE_DRIFT = Duration.ofMinutes(5);
+
+    /**
+     * Checks whether {@code remote}'s physical component is within {@code maxFutureDrift} of this
+     * node's own current physical time, throwing {@link RemoteTimestampRejectedException} if not.
+     * Purely a check — does not read or modify this clock's state, and calling it never advances
+     * anything. Intended use: call this immediately before {@link #update} for any timestamp that
+     * arrived from a remote peer (never for a purely local value, which by definition can't have
+     * this problem); on rejection, the caller should not call {@code update} with that value, and
+     * should not process whatever event carried it, exactly as the pre-M6 cleanup pass's own
+     * checklist item for this describes ("reject or quarantine... log the event clearly").
+     *
+     * <p>Deliberately only checks the future direction. A remote timestamp far in the PAST is not
+     * a trust problem the way one far in the future is — {@code update}'s own {@code max()}-based
+     * algorithm already handles a stale/slow peer correctly (this node's own physical time simply
+     * dominates), and rejecting old-but-honest messages would be actively wrong.
+     */
+    public void checkDrift(HlcTimestamp remote, Duration maxFutureDrift) {
+        Objects.requireNonNull(remote, "remote");
+        Objects.requireNonNull(maxFutureDrift, "maxFutureDrift");
+        long pt = physicalClock.millis();
+        long driftMillis = remote.physical() - pt;
+        long maxDriftMillis = maxFutureDrift.toMillis();
+        if (driftMillis > maxDriftMillis) {
+            throw new RemoteTimestampRejectedException(remote.physical(), pt, driftMillis, maxDriftMillis);
+        }
+    }
+
+    /** {@link #checkDrift(HlcTimestamp, Duration)} using {@link #DEFAULT_MAX_FUTURE_DRIFT}. */
+    public void checkDrift(HlcTimestamp remote) {
+        checkDrift(remote, DEFAULT_MAX_FUTURE_DRIFT);
     }
 }

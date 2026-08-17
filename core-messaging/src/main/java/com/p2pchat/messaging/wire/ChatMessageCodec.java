@@ -29,6 +29,11 @@ import java.nio.charset.StandardCharsets;
  *
  * <p>Logic verified standalone before being wired into any networking — see the M5b section of
  * README.md.
+ *
+ * <p><b>Pre-M6 cleanup pass:</b> marker validation here was already correct (the exhaustive
+ * {@code switch} with a {@code default -> throw} below predates this pass). {@link #getBytes}'s
+ * length-prefix read had the same unchecked-allocation gap {@code RelayFrameCodec} had — see
+ * that class's own Javadoc for why it matters — fixed the same way here.
  */
 public final class ChatMessageCodec {
 
@@ -51,6 +56,9 @@ public final class ChatMessageCodec {
     }
 
     public static ChatWireMessage decode(byte[] wire) {
+        if (wire.length < 1) {
+            throw new IllegalArgumentException("Chat message too short: " + wire.length + " bytes");
+        }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
         return switch (marker) {
@@ -155,6 +163,10 @@ public final class ChatMessageCodec {
 
     private static byte[] getBytes(ByteBuffer buf) {
         int length = buf.getInt();
+        if (length < 0 || length > buf.remaining()) {
+            throw new IllegalArgumentException(
+                    "Malformed length-prefixed field: length=" + length + ", remaining=" + buf.remaining());
+        }
         byte[] bytes = new byte[length];
         buf.get(bytes);
         return bytes;

@@ -37,6 +37,7 @@ import java.nio.file.Path;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -68,6 +69,20 @@ import java.util.concurrent.ConcurrentHashMap;
  * instead of it. {@code saveFileMetadata} had to become an upsert (see {@code SqliteStorageService})
  * because {@code file_chunk_state} has a foreign key on the row it creates, and a resumed
  * transfer legitimately re-establishes that row.
+ *
+ * <p><b>Pre-M6 cleanup pass — the same Netty event-loop deadlock M5c found and fixed in chat,
+ * present here too and fixed the same way.</b> {@code handleOffer} was calling
+ * {@code network.sendEnvelope(...)} synchronously to reply with a {@code FileChunkRequestPayload}
+ * — but {@code handleOffer} runs on the {@code OnEnvelopeMessage} callback's thread, which is
+ * jvm-libp2p/Netty's I/O event loop. See {@code ChatListenerMain}'s own Javadoc for the full
+ * mechanical account of why that deadlocks. This predates M5c: M4c (this class's own milestone)
+ * happened before that deadlock was ever found, so this class never got the fix the two chat
+ * daemons did — same hazard, just never triggered on the machine M4c's own real-hardware run
+ * used, since a single-chunk-request reply may not have raced the connection setup the way a
+ * chat reply's timing did. Fixed identically: {@code sendAsync} composes the encrypted frame
+ * first, then sends it from inside {@link CompletableFuture#runAsync}, with its own try/catch —
+ * {@code CompletableFuture.runAsync} silently swallows uncaught exceptions in fire-and-forget
+ * usage, so that catch isn't optional.
  */
 public class FileReceiverMain {
 
@@ -195,7 +210,12 @@ public class FileReceiverMain {
             missingArray[i] = missing.get(i);
         }
         FileChunkRequestPayload request = new FileChunkRequestPayload(offer.transferId(), missingArray);
-        sendMessage(network, sessions, offer.senderAddress(), remote, request);
+        EncryptedFrame frame = encodeAndEncrypt(sessions, remote, request);
+
+        // sendEnvelope MUST NOT be called synchronously from here — see this class's own Javadoc
+        // for the full account of why. Composed above (encoding + encryption is cheap CPU work,
+        // fine on this thread); only the actual network send is offloaded.
+        sendAsync(network, offer.senderAddress(), frame, "chunk-request");
     }
 
     private static void handleChunk(FileChunkPayload chunkPayload, Map<String, ReceivingTransfer> transfers,
@@ -257,12 +277,26 @@ public class FileReceiverMain {
         }
     }
 
-    private static void sendMessage(PeerNetworkService network, SecureSessionService sessions,
-                                     String targetAddress, SignalProtocolAddress remote,
-                                     FileTransferMessage message) throws Exception {
+    private static EncryptedFrame encodeAndEncrypt(SecureSessionService sessions, SignalProtocolAddress remote,
+                                                     FileTransferMessage message) throws Exception {
         byte[] plaintext = FileTransferMessageCodec.encode(message);
-        EncryptedFrame frame = sessions.encrypt(remote, plaintext);
-        network.sendEnvelope(targetAddress, EncryptedFrameCodec.encode(frame));
+        return sessions.encrypt(remote, plaintext);
+    }
+
+    /**
+     * Sends {@code frame} from inside a {@link CompletableFuture#runAsync} block — see this
+     * class's own Javadoc for why this cannot run synchronously from an {@code OnEnvelopeMessage}
+     * callback. Identical pattern to {@code ChatListenerMain}'s own {@code sendAsync}.
+     */
+    private static void sendAsync(PeerNetworkService network, String targetAddress, EncryptedFrame frame, String label) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                network.sendEnvelope(targetAddress, EncryptedFrameCodec.encode(frame));
+            } catch (Exception e) {
+                System.out.println("[file] FAILED to send (" + label + ") to " + targetAddress + ": " + e);
+                e.printStackTrace(System.out);
+            }
+        });
     }
 
     /** What this process needs to serve the live callback for one transfer. Completion state itself lives in storage, not here. */

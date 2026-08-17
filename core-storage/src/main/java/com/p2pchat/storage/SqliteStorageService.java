@@ -170,6 +170,45 @@ public final class SqliteStorageService implements StorageService {
     }
 
     @Override
+    public boolean hasMessage(String messageId) {
+        String sql = "SELECT 1 FROM messages WHERE message_id = ? LIMIT 1";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, messageId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next();
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to check for existing message " + messageId, e);
+        }
+    }
+
+    @Override
+    public void updateDeliveryState(String messageId, DeliveryState newState) {
+        String sql = "UPDATE messages SET delivery_state = ? WHERE message_id = ?";
+        runUpdate(sql, statement -> {
+            statement.setString(1, newState.name());
+            statement.setString(2, messageId);
+        });
+    }
+
+    @Override
+    public void markMessagesReadUpTo(String conversationId, PeerId senderPeerId, String readUpToHlcTimestamp) {
+        // sender_peer_id = ? restricts this to THIS node's own outgoing messages in the
+        // conversation — see this method's own Javadoc on StorageService for why that's not
+        // optional. delivery_state != 'READ' isn't required for correctness (re-marking READ as
+        // READ is harmless) but avoids rewriting rows that don't need it.
+        String sql = "UPDATE messages SET delivery_state = ? " +
+                "WHERE conversation_id = ? AND sender_peer_id = ? AND hlc_timestamp <= ? AND delivery_state != ?";
+        runUpdate(sql, statement -> {
+            statement.setString(1, DeliveryState.READ.name());
+            statement.setString(2, conversationId);
+            statement.setString(3, senderPeerId.value());
+            statement.setString(4, readUpToHlcTimestamp);
+            statement.setString(5, DeliveryState.READ.name());
+        });
+    }
+
+    @Override
     public <T> T runInTransaction(Supplier<T> work) {
         Connection connection = database.connection();
         try {

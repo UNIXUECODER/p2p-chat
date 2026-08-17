@@ -1,7 +1,9 @@
 package com.p2pchat.storage;
 
+import com.p2pchat.model.PeerId;
 import com.p2pchat.storage.model.Contact;
 import com.p2pchat.storage.model.Conversation;
+import com.p2pchat.storage.model.DeliveryState;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.Pagination;
@@ -27,6 +29,13 @@ import java.util.function.Supplier;
  * for any conversation not created by some out-of-band means. See {@link Conversation}'s Javadoc
  * for why this is intentionally narrower than full conversation/membership management, which is
  * still M5/M8's job.
+ *
+ * <p><b>M5d update:</b> {@link #hasMessage}, {@link #updateDeliveryState}, and
+ * {@link #markMessagesReadUpTo} added — the storage-layer half of "message-id dedup + delivery/
+ * read receipt state transitions" (see the M5d section of README.md). Deliberately three narrow,
+ * targeted methods rather than one general "patch a message" method, matching this interface's
+ * existing convention (see {@link #markChunkReceived}) of adding exactly the operation a real
+ * caller needs, not a broader one guessed at in advance.
  */
 public interface StorageService {
 
@@ -71,6 +80,53 @@ public interface StorageService {
 
     /** Returns the indices in {@code [0, totalChunks)} NOT yet marked received for this transfer — empty means the transfer is complete. */
     List<Integer> missingChunks(String transferId, int totalChunks);
+
+    /**
+     * M5d: returns true if a message with this {@code messageId} has already been persisted.
+     * Callers receiving an inbound {@code ChatMessagePayload} check this <i>before</i> calling
+     * {@link #saveMessage} — docs/architecture-spec.md §15's "Duplicate message delivery (e.g.
+     * via both a direct reconnect and a queued relay copy) → dedup on message_id at the storage
+     * layer before it ever reaches the UI."
+     *
+     * <p>Deliberately a query the caller consults, not a behavior change to {@link #saveMessage}
+     * itself. {@link #saveMessage} stays a plain insert (see its own Javadoc) so a genuine bug
+     * that tries to reuse a {@code messageId} for two different messages fails loudly with a
+     * primary-key violation, instead of an {@code INSERT OR IGNORE} silently discarding the
+     * second one and masking the bug — the same "fail loud on a real bug, upsert only for a
+     * legitimately-repeatable call" distinction {@link #saveFileMetadata} vs. this interface's
+     * plain-insert methods already draws.
+     */
+    boolean hasMessage(String messageId);
+
+    /**
+     * M5d: updates the {@code delivery_state} of one existing message, identified by
+     * {@code messageId}. Two real callers: an inbound {@code DeliveryReceiptPayload}
+     * (state → {@code DELIVERED}, for a message this node originally sent), and a local
+     * "mark read" action on a message this device received (state → {@code READ}). A no-op
+     * (does not throw) if {@code messageId} doesn't exist — a receipt racing ahead of, or
+     * arriving after, a local dedup/cleanup path shouldn't be able to crash the caller for
+     * something this secondary to the main flow.
+     */
+    void updateDeliveryState(String messageId, DeliveryState newState);
+
+    /**
+     * M5d: marks every message in {@code conversationId} <b>authored by {@code senderPeerId}</b>
+     * with {@code hlc_timestamp <= readUpToHlcTimestamp} as {@code READ}. The handler for an
+     * inbound {@code ReadReceiptPayload}: the receipt's sender is reporting they've read
+     * everything up to a point in the conversation, so this updates the delivery_state of
+     * <i>this node's own outgoing messages</i> in that range — never the receipt-sender's own
+     * messages, which this node has no authority to mark on their behalf. {@code senderPeerId}
+     * is therefore always this node's own {@code PeerId} at the call site, not the receipt's
+     * remote sender.
+     *
+     * <p>{@code hlc_timestamp} comparison is plain SQLite {@code TEXT} ordering
+     * ({@code <=} on the column), which is safe here specifically because
+     * {@code core-messaging.HlcTimestamp#toString()}'s fixed-width zero-padded encoding makes
+     * string order agree with causal order exactly (see that class's own Javadoc and
+     * {@code HlcTimestampTest.stringOrderingMatchesCompareTo}) — not a coincidence this method
+     * relies on without justification.
+     */
+    void markMessagesReadUpTo(String conversationId, PeerId senderPeerId, String readUpToHlcTimestamp);
 
     /** Runs {@code work} inside a single SQLite transaction, committing on normal return and rolling back if {@code work} throws. */
     <T> T runInTransaction(Supplier<T> work);

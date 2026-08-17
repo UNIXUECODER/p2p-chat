@@ -7,6 +7,8 @@ import com.p2pchat.filetransfer.wire.FileTransferMessage;
 import com.p2pchat.filetransfer.wire.FileTransferMessageCodec;
 import org.junit.jupiter.api.Test;
 
+import java.nio.ByteBuffer;
+
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
@@ -83,5 +85,36 @@ class FileTransferMessageCodecTest {
         assertThatThrownBy(() -> FileTransferMessageCodec.decode(badWire))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Unknown file-transfer message marker");
+    }
+
+    // --- Pre-M6 cleanup pass: length-prefixed string/array fields had no bounds check at all —
+    // same gap RelayFrameCodec had (see its own test/Javadoc), fixed the same way here. ---
+
+    @Test
+    void rejectOversizedStringLength() {
+        ByteBuffer buf = ByteBuffer.allocate(5);
+        buf.put((byte) 6); // FILE_OFFER_MARKER
+        buf.putInt(Integer.MAX_VALUE); // transferId's claimed length
+        assertThatThrownBy(() -> FileTransferMessageCodec.decode(buf.array()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed length-prefixed field");
+    }
+
+    @Test
+    void rejectOversizedChunkIndexCount() {
+        ByteBuffer buf = ByteBuffer.allocate(9);
+        buf.put((byte) 7); // FILE_CHUNK_REQUEST_MARKER
+        buf.putInt(0); // empty (valid) transferId string
+        buf.putInt(Integer.MAX_VALUE); // absurd chunk-index count
+        assertThatThrownBy(() -> FileTransferMessageCodec.decode(buf.array()))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Malformed chunk-index count");
+    }
+
+    @Test
+    void rejectEmptyWire() {
+        assertThatThrownBy(() -> FileTransferMessageCodec.decode(new byte[0]))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("File-transfer message too short");
     }
 }

@@ -25,6 +25,11 @@ import java.nio.charset.StandardCharsets;
  * <p>Logic verified standalone — 22 round-trip and edge-case checks (unicode filenames, empty
  * chunk-index arrays, zero-length ciphertext, malformed key/nonce lengths rejected at encode
  * time) — before being wired into any networking. See node-daemon's {@code WireCodecDemoMain}.
+ *
+ * <p><b>Pre-M6 cleanup pass:</b> marker validation here was already correct (the exhaustive
+ * {@code switch} with a {@code default -> throw} below predates this pass). {@link #getString}'s
+ * length-prefix read had the same unchecked-allocation gap {@code RelayFrameCodec} had — see
+ * that class's own Javadoc for why it matters — fixed the same way here.
  */
 public final class FileTransferMessageCodec {
 
@@ -47,6 +52,9 @@ public final class FileTransferMessageCodec {
     }
 
     public static FileTransferMessage decode(byte[] wire) {
+        if (wire.length < 1) {
+            throw new IllegalArgumentException("File-transfer message too short: " + wire.length + " bytes");
+        }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
         return switch (marker) {
@@ -119,6 +127,13 @@ public final class FileTransferMessageCodec {
     private static FileChunkRequestPayload decodeRequest(ByteBuffer buf) {
         String transferId = getString(buf);
         int count = buf.getInt();
+        // Same reasoning as getString's own bounds check (see this class's own Javadoc): count
+        // is attacker/corruption-controlled input, and each index consumes 4 bytes, so bound it
+        // against what the buffer can actually still supply before allocating.
+        if (count < 0 || count > buf.remaining() / 4) {
+            throw new IllegalArgumentException(
+                    "Malformed chunk-index count: count=" + count + ", remaining=" + buf.remaining());
+        }
         int[] indices = new int[count];
         for (int i = 0; i < count; i++) {
             indices[i] = buf.getInt();
@@ -163,6 +178,10 @@ public final class FileTransferMessageCodec {
 
     private static String getString(ByteBuffer buf) {
         int length = buf.getInt();
+        if (length < 0 || length > buf.remaining()) {
+            throw new IllegalArgumentException(
+                    "Malformed length-prefixed field: length=" + length + ", remaining=" + buf.remaining());
+        }
         byte[] bytes = new byte[length];
         buf.get(bytes);
         return new String(bytes, StandardCharsets.UTF_8);

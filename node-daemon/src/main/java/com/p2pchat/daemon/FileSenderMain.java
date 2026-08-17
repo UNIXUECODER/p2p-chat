@@ -19,6 +19,7 @@ import com.p2pchat.filetransfer.wire.FileTransferMessageCodec;
 import com.p2pchat.identity.Identity;
 import com.p2pchat.identity.IdentityService;
 import com.p2pchat.identity.JavaIdentityService;
+import com.p2pchat.network.DialableAddressResolver;
 import com.p2pchat.network.Libp2pNetworkService;
 import com.p2pchat.network.PeerNetworkService;
 import org.signal.libsignal.protocol.SignalProtocolAddress;
@@ -27,9 +28,12 @@ import org.signal.libsignal.protocol.state.impl.InMemorySignalProtocolStore;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -40,6 +44,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * act as a listener, to receive and answer the FileChunkRequestPayload that comes back.
  *
  * No resume in M4c — see FileReceiverMain's Javadoc.
+ *
+ * <p><b>Pre-M6 cleanup pass — the same Netty event-loop deadlock M5c found and fixed in chat
+ * (and just fixed in {@code FileReceiverMain}'s own equivalent gap), present here too.</b> The
+ * chunk-request handler was calling {@code network.sendEnvelope(...)} once per requested chunk,
+ * synchronously, from inside the {@code OnEnvelopeMessage} callback — jvm-libp2p/Netty's I/O
+ * event loop thread. See {@code ChatListenerMain}'s Javadoc for the deadlock mechanics. Fixed the
+ * same way, with one difference from the single-message fix in {@code FileReceiverMain}/chat:
+ * this handler can send several chunks per callback invocation, so ALL of them are encoded and
+ * encrypted first (cheap CPU work, fine on this thread), then sent sequentially from inside ONE
+ * {@link CompletableFuture#runAsync} block — not one async block per chunk, which could let
+ * chunks race each other and arrive out of order for no benefit.
  */
 public class FileSenderMain {
 
@@ -116,16 +131,21 @@ public class FileSenderMain {
                     }
                     System.out.println("[file] chunk request received: " + request.missingChunkIndices().length + " chunk(s) requested");
 
+                    List<EncryptedFrame> outgoingFrames = new ArrayList<>();
+                    List<Integer> chunkIndicesInOrder = new ArrayList<>();
                     for (int chunkIndex : request.missingChunkIndices()) {
                         byte[] plaintextChunk = FileChunker.readChunk(source, chunkIndex, chunkSize);
                         EncryptedChunk encrypted = ChunkCipher.encrypt(fileKey, chunkIndex, plaintextChunk);
                         FileChunkPayload chunkPayload = new FileChunkPayload(
                                 request.transferId(), chunkIndex, encrypted.nonce(), encrypted.ciphertext());
-                        sendMessage(network, sessions, receiverAddress, remote, chunkPayload);
-                        System.out.println("[file] sent chunk " + chunkIndex);
+                        outgoingFrames.add(sessions.encrypt(remote, FileTransferMessageCodec.encode(chunkPayload)));
+                        chunkIndicesInOrder.add(chunkIndex);
                     }
-                    System.out.println();
-                    System.out.println("All requested chunks sent. Check the receiver's console for M4c CONFIRMED.");
+
+                    // sendEnvelope MUST NOT be called synchronously from here — see this class's
+                    // own Javadoc for the full account. All requested chunks are composed above,
+                    // then sent sequentially from inside ONE async block below.
+                    sendChunksAsync(network, receiverAddress, outgoingFrames, chunkIndicesInOrder);
 
                 } else {
                     System.out.println("[file] unexpected message type from " + sender + ": " + message);
@@ -143,7 +163,13 @@ public class FileSenderMain {
         // network.listenAddresses() is already populated by this point — network.start() ran
         // above. Reporting our own address here is what lets the receiver reply without ever
         // being told our address in advance; see FileOfferPayload's Javadoc for why.
-        String ownAddress = network.listenAddresses()[0];
+        //
+        // M5d: previously read network.listenAddresses()[0] raw, which is the same wildcard-bind
+        // gap ChatListenerMain/ChatSenderMain hit in M5c (see DialableAddressResolver's own
+        // Javadoc for the full account) — this class just never happened to surface it on the
+        // machine M4c's own real-hardware run used. Now resolved the same way those two classes
+        // are, for the same reason: a wildcard address is not one the receiver can dial back to.
+        String ownAddress = DialableAddressResolver.resolve(network.listenAddresses());
         FileOfferPayload offer = new FileOfferPayload(
                 transferId, ownAddress, fileToSend.getFileName().toString(), fileSize, fileHash, chunkSize, totalChunks, fileKey.bytes());
         sendMessage(network, sessions, receiverAddress, remoteSignalAddress, offer);
@@ -160,6 +186,29 @@ public class FileSenderMain {
         byte[] plaintext = FileTransferMessageCodec.encode(message);
         EncryptedFrame frame = sessions.encrypt(remote, plaintext);
         network.sendEnvelope(targetAddress, EncryptedFrameCodec.encode(frame));
+    }
+
+    /**
+     * Sends {@code frames} sequentially, one {@code sendEnvelope} call each, from inside a single
+     * {@link CompletableFuture#runAsync} block — see this class's own Javadoc for why. Unlike
+     * {@link #sendMessage}, safe to call from inside the {@code OnEnvelopeMessage} callback.
+     * {@code chunkIndicesInOrder} is parallel to {@code frames}, purely for the per-chunk log line.
+     */
+    private static void sendChunksAsync(PeerNetworkService network, String targetAddress,
+                                         List<EncryptedFrame> frames, List<Integer> chunkIndicesInOrder) {
+        CompletableFuture.runAsync(() -> {
+            try {
+                for (int i = 0; i < frames.size(); i++) {
+                    network.sendEnvelope(targetAddress, EncryptedFrameCodec.encode(frames.get(i)));
+                    System.out.println("[file] sent chunk " + chunkIndicesInOrder.get(i));
+                }
+                System.out.println();
+                System.out.println("All requested chunks sent. Check the receiver's console for M4c CONFIRMED.");
+            } catch (Exception e) {
+                System.out.println("[file] FAILED to send chunk(s) to " + targetAddress + ": " + e);
+                e.printStackTrace(System.out);
+            }
+        });
     }
 
     private static String extractPeerId(String multiaddr) {

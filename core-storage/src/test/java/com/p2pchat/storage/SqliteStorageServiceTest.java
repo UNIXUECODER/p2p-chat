@@ -136,4 +136,73 @@ class SqliteStorageServiceTest {
         assertThat(messages).hasSize(1);
         assertThat(messages.get(0).messageId()).isEqualTo("m1");
     }
+
+    // --- M5d: message dedup + delivery/read receipt state transitions -----------------------
+
+    @Test
+    void hasMessageReflectsWhetherAMessageIdHasBeenSaved() {
+        storageService.saveConversation(new Conversation("c1", ConversationType.DIRECT, "Bob", 1000));
+
+        assertThat(storageService.hasMessage("m1")).isFalse();
+
+        storageService.saveMessage(new Message("m1", "c1", new PeerId("p1"), new DeviceId("0"),
+                "1000-1", "text/plain", "Hello".getBytes(), DeliveryState.SENT, System.currentTimeMillis()));
+
+        assertThat(storageService.hasMessage("m1")).isTrue();
+        assertThat(storageService.hasMessage("m-does-not-exist")).isFalse();
+    }
+
+    @Test
+    void updateDeliveryStateChangesAnExistingMessagesState() {
+        storageService.saveConversation(new Conversation("c1", ConversationType.DIRECT, "Bob", 1000));
+        storageService.saveMessage(new Message("m1", "c1", new PeerId("p1"), new DeviceId("0"),
+                "1000-1", "text/plain", "Hello".getBytes(), DeliveryState.SENT, System.currentTimeMillis()));
+
+        storageService.updateDeliveryState("m1", DeliveryState.DELIVERED);
+
+        Message updated = storageService.queryMessages("c1", new Pagination(null, 10)).get(0);
+        assertThat(updated.state()).isEqualTo(DeliveryState.DELIVERED);
+    }
+
+    @Test
+    void updateDeliveryStateOnUnknownMessageIdIsANoOp() {
+        // Must not throw — a receipt racing ahead of a local dedup/cleanup path shouldn't be
+        // able to crash the caller. See this method's Javadoc on StorageService.
+        storageService.updateDeliveryState("no-such-message", DeliveryState.READ);
+    }
+
+    @Test
+    void markMessagesReadUpToOnlyTouchesTheGivenSendersMessagesAtOrBeforeTheWatermark() {
+        PeerId alice = new PeerId("alice");
+        PeerId bob = new PeerId("bob");
+        storageService.saveConversation(new Conversation("c1", ConversationType.DIRECT, "Bob", 1000));
+
+        // Deliberately using HlcTimestamp's real zero-padded string form (see that class's
+        // Javadoc) rather than arbitrary strings, since markMessagesReadUpTo relies on plain
+        // TEXT '<=' comparison agreeing with causal order.
+        storageService.saveMessage(new Message("m1", "c1", alice, new DeviceId("0"),
+                "0000000000000001000-0000000000-alice", "text/plain", "one".getBytes(), DeliveryState.SENT, 1));
+        storageService.saveMessage(new Message("m2", "c1", alice, new DeviceId("0"),
+                "0000000000000002000-0000000000-alice", "text/plain", "two".getBytes(), DeliveryState.SENT, 2));
+        storageService.saveMessage(new Message("m3", "c1", alice, new DeviceId("0"),
+                "0000000000000003000-0000000000-alice", "text/plain", "three-after-watermark".getBytes(), DeliveryState.SENT, 3));
+        storageService.saveMessage(new Message("m-bob", "c1", bob, new DeviceId("0"),
+                "0000000000000002500-0000000000-bob", "text/plain", "bobs-own".getBytes(), DeliveryState.DELIVERED, 4));
+
+        storageService.markMessagesReadUpTo("c1", alice, "0000000000000002000-0000000000-alice");
+
+        List<Message> messages = storageService.queryMessages("c1", new Pagination(null, 10));
+        assertThat(stateOf(messages, "m1")).isEqualTo(DeliveryState.READ);
+        assertThat(stateOf(messages, "m2")).isEqualTo(DeliveryState.READ);
+        assertThat(stateOf(messages, "m3")).isEqualTo(DeliveryState.SENT); // after the watermark — untouched
+        assertThat(stateOf(messages, "m-bob")).isEqualTo(DeliveryState.DELIVERED); // Bob's own — untouched
+    }
+
+    private static DeliveryState stateOf(List<Message> messages, String messageId) {
+        return messages.stream()
+                .filter(m -> m.messageId().equals(messageId))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("expected message " + messageId + " to be present"))
+                .state();
+    }
 }
