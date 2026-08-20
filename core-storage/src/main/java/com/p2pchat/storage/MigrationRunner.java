@@ -28,7 +28,9 @@ import java.util.List;
 public final class MigrationRunner {
 
     private static final List<String> MIGRATIONS = List.of(
-            "V001__init.sql"
+            "V001__init.sql",
+            "V002__signal_store.sql",
+            "V003__kyber_base_key_replay.sql"
     );
 
     private static final String RESOURCE_ROOT = "/db/migration/";

@@ -354,6 +354,8 @@ message FileChunkPayload {
 
 `.proto` files live in `api-contract` (not yet scaffolded) and will be the single source of truth — both the Java backend and any future non-Java peer implementation compile against the same schema. Until then, `core-filetransfer.wire.FileTransferMessageCodec`'s hand-rolled binary format (documented in that class) is the actual source of truth for what M4 sends on the wire, matching the rest of this project's wire formats (`RelayFrameCodec`, `DiscoveryFrameCodec`, `EncryptedFrameCodec`), none of which use protobuf yet either. `core-messaging.wire.ChatMessageCodec` (M5b) follows the identical hand-rolled convention, as its own independent codec — not a shared one with file transfer; see `ChatWireMessage`'s Javadoc for why unifying the two was considered and deliberately deferred again, past M5.
 
+**Implementation note (M6a):** the deferral above ended here — `node-daemon`'s `ApplicationMessageRouter` now provides the single dispatch boundary a live daemon session needs, peeking the marker byte this table already assigns (`{2,3,4}` chat, `{6,7,8}` file transfer — already disjoint, confirmed before writing anything) and delegating to whichever codec owns it. Neither `ChatMessageCodec` nor `FileTransferMessageCodec` changed; a thin `DispatchedMessage` wrapper in `node-daemon` is the entire addition, not a merge of the two hierarchies. Markers `0`/`1` (`HANDSHAKE_INIT`/`HANDSHAKE_RESPONSE`) are treated as reaching this router in error, not as a real case to route — PQXDH session establishment already happens transparently inside `SecureSessionService.decrypt()`, one layer below, via libsignal's own PreKeySignalMessage/SignalMessage distinction (the `EncryptedFrame` `0x01`/`0x02` marker above); by the time a marker byte reaches the router, a session already exists. `5` (`GROUP_OP`) and `9` (`PRESENCE_PING`) are reserved-not-unknown, rejected with a message saying so rather than a generic error.
+
 ### Custom protocol wire formats (already implemented)
 
 In addition to the protobuf application layer above, three custom libp2p protocol wire formats are implemented directly in `core-network` as simple binary codecs:
@@ -514,6 +516,52 @@ CREATE TABLE crdt_ops_log (
 
 Migrations are managed with a versioned-script runner (`V001__init.sql`, `V002__...sql`) applied on daemon startup — never hand-edit the schema in place once shipped.
 
+**M6e-1 added `V002__signal_store.sql`** — persistent storage for Signal Protocol sessions, pre-keys, and remote identity keys, backing a new `SqliteSignalProtocolStore` (`node-daemon`, deliberately not `core-storage` — that module gains no `libsignal-client` dependency by this):
+
+```sql
+CREATE TABLE signal_sessions (
+  address           TEXT PRIMARY KEY,   -- "<SignalProtocolAddress name>.<deviceId>"
+  session_record    BLOB NOT NULL,      -- SessionRecord.serialize()
+  updated_at        INTEGER NOT NULL
+);
+
+CREATE TABLE signal_pre_keys (
+  prekey_id         INTEGER PRIMARY KEY,
+  record            BLOB NOT NULL       -- PreKeyRecord.serialize()
+);
+
+CREATE TABLE signal_signed_pre_keys (
+  signed_prekey_id  INTEGER PRIMARY KEY,
+  record            BLOB NOT NULL       -- SignedPreKeyRecord.serialize()
+);
+
+CREATE TABLE signal_kyber_pre_keys (
+  kyber_prekey_id   INTEGER PRIMARY KEY,
+  record            BLOB NOT NULL,      -- KyberPreKeyRecord.serialize()
+  used              INTEGER NOT NULL DEFAULT 0   -- flagged, not deleted -- see note below
+);
+
+CREATE TABLE signal_identities (
+  address           TEXT PRIMARY KEY,
+  identity_key      BLOB NOT NULL       -- IdentityKey.serialize()
+);
+```
+
+Every column is an opaque blob — `.serialize()` in, the matching `byte[]` constructor out, never inspected, per Signal's own guidance for store implementations. Deliberately *not* in this table: this node's own local identity (`IdentityKeyPair` + registration ID), which stays exactly where `SignalIdentityVault` (M2a) already puts it, in `dataDir/signal-identity.key`/`.reg` — only genuinely dynamic runtime state lives here. `signal_kyber_pre_keys.used` is a deliberate departure from the `DELETE`-on-consume approach `signal_pre_keys` uses: `removePreKey` really does `DELETE FROM signal_pre_keys` — the actual point of that table existing at all, since forward secrecy across a restart depends on a consumed one-time prekey being physically gone — but Kyber prekeys in PQXDH are last-resort/reusable rather than strictly single-use, and `markKyberPreKeyUsed` is a genuinely different SPI method from `removePreKey` for exactly that reason.
+
+**`V003__kyber_base_key_replay.sql`** followed once a real build against `libsignal-client` 0.94.0 showed `markKyberPreKeyUsed`'s actual signature takes `(kyberPreKeyId, signedPreKeyId, ECPublicKey baseKey)` and can throw `ReusedBaseKeyException` — real base-key replay protection, not the bare consumption flag `V002` assumed:
+
+```sql
+CREATE TABLE signal_kyber_base_keys_seen (
+  kyber_prekey_id   INTEGER NOT NULL,
+  signed_prekey_id  INTEGER NOT NULL,
+  base_key          BLOB NOT NULL,      -- ECPublicKey.serialize()
+  PRIMARY KEY (kyber_prekey_id, signed_prekey_id, base_key)
+);
+```
+
+A new migration, not an edit to `V002` — that table is already applied against real data by the time this was needed, and `V002`'s own comment already states the "never hand-edit the schema in place once shipped" rule this follows. The composite `PRIMARY KEY` does two jobs at once: persists the replay check across a restart (the first draft tracked seen base keys in a plain in-memory `Map`, silently losing that protection every time the daemon restarted — the exact problem this whole section's schema exists to solve, reappearing inside itself), and compares by actual key bytes rather than by Java object identity (the in-memory draft used `Set<ECPublicKey>`, which relies on `ECPublicKey` having value-based `equals()`/`hashCode()` — nothing confirms it does, and SQL's own `PRIMARY KEY` uniqueness sidesteps the question entirely).
+
 ---
 
 ## 10. Connectivity: discovery, NAT traversal, relay
@@ -582,7 +630,7 @@ Concrete failure modes to design against now, not discover later:
 - **Duplicate message delivery** (e.g. via both a direct reconnect and a queued relay copy) → dedup on `message_id` at the storage layer before it ever reaches the UI.
 - **Clock skew across peers** → HLC instead of wall-clock for all ordering (§11).
 - **Relay node unavailable** → client retries other known relays/bootstrap nodes, and surfaces `UNREACHABLE` connectivity honestly rather than hanging silently.
-- **Key compromise / device loss** → identity key rotation path must exist even in v1 (rotating signed prekeys via `rotateSignedPreKey()`), with contacts re-verifying via safety number after a rotation.
+- **Key compromise / device loss** → identity key rotation path must exist even in v1 (rotating signed prekeys via `rotateSignedPreKey()`), with contacts re-verifying via safety number after a rotation. *(M6e-1 implemented the storage-layer mechanism this depends on: `SqliteSignalProtocolStore.saveIdentity` distinguishes "first time seeing this address" from "a genuinely different identity replacing a previously-trusted one" and reports which happened; `isTrustedIdentity` refuses the latter case outright rather than silently accepting a swapped key. The UI flow itself — surfacing that change to the user, prompting safety-number re-verification — is not built; this is only the signal a future UI would consume.)*
 - **Group membership race** (two admins remove different members simultaneously) → resolved automatically by the CRDT merge (§11) rather than needing a "last writer wins" special case.
 - **Malicious or spam peer** → local block-list enforced client-side (no central authority to appeal to, so this must be usable and prominent in the UI from v1).
 - **Discovery record spoofing** → currently no signature on published records (low risk while only network addresses are published — worst case is a failed connection attempt). Becomes security-critical once PreKeyBundle discovery is added; signatures on published records must be added at that point.
@@ -654,7 +702,10 @@ Concrete failure modes to design against now, not discover later:
 
 17. **M5e** ✅ (verified on real hardware) — Pre-M6 cleanup pass, from a peer-authored checklist reviewed against the actual source before acting on it. Four real, checkable items: (1) the same Netty-event-loop deadlock M5c found in chat, present and fixed identically in `FileReceiverMain`/`FileSenderMain`'s callback-triggered sends, never backported since M4c predates that discovery; (2) unknown-marker validation and length-prefix bounds checks audited and hardened across all 6 wire codecs in the project, not just the 2 originally flagged — `EncryptedFrameCodec`/`RelayFrameCodec` had the actual silent-misdecode bug, the rest were missing allocation bounds checks; (3) `HybridLogicalClock.checkDrift`, a strictly additive opt-in guard against an implausibly-future remote timestamp — closes a gap that class's own Javadoc had flagged as deferred since M5a, without touching `update`'s own algorithm at all; (4) a permanent `-Pduplicatesend` test flag proving M5d's dedup path live, not just via its storage-layer unit test. A larger set of M6-scoped design questions (canonical peer identity, shared chat/file dispatch, one outbound send path, discovery record shape, pre-key bundle lifecycle, storage transaction boundaries, a daemon error vocabulary) were deliberately identified and left open rather than answered here — see "Open M6 design decisions" in README.md.
 
-18. **M6** 🔜 — `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope. First long-running process holding multiple simultaneous peer sessions — everything through M5e is one-shot CLI demos. Also where M3c's discovery replaces manually hand-carrying a bundle file/multiaddr between terminals.
+18. **M6** 🔄 — `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope. First long-running process holding multiple simultaneous peer sessions — everything through M5e is one-shot CLI demos. Also where M3c's discovery replaces manually hand-carrying a bundle file/multiaddr between terminals. In progress, broken into sub-milestones (M6a–M6h) rather than done as one pass, following the same discipline M2–M5 used:
+    - **M6a** ✅ (verified) — Shared decrypted-message dispatch: `ApplicationMessageRouter` + `DispatchedMessage` in `node-daemon`. See the M6a section of README.md.
+    - **M6e-1** ✅ (verified against real SQLite & libsignal-client) — Persistent Signal Protocol session store (`SqliteSignalProtocolStore`, `SynchronizedSignalProtocolStore`, `V002__signal_store.sql`, `V003__kyber_base_key_replay.sql` — see §9). Built and proven in isolation ahead of M6b–M6d despite the letter ordering: a deliberate reordering, since this is the highest-blast-radius single piece in the whole M6 roadmap. Fully verified against real `libsignal-client` 0.94.0 and SQLite storage, including persistent Kyber base-key replay protection across restarts and end-to-end PQXDH session continuation across daemon shutdown. See the M6e-1 section of README.md.
+    - Remaining: M6b (one outbound send path), M6c (hand-rolled JSON value model), M6d (hand-rolled WebSocket transport), M6e-2 (wiring the M6e-1 store into a live multi-session daemon core), M6f (signed discovery records), M6g (JSON-RPC method surface + push events), M6h (`DaemonMain` composition root).
 
 19. **M7** 🔜 — Electron frontend wired against the API — 1:1 chat + file transfer UI.
 

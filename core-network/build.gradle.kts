@@ -5,6 +5,7 @@ plugins {
 dependencies {
     api(project(":core-model"))
     api("com.github.libp2p:jvm-libp2p:1.3.4")
+    implementation("io.netty:netty-codec-http:4.2.10.Final")
     implementation("org.jetbrains.kotlin:kotlin-stdlib:1.9.22")
 }
 
