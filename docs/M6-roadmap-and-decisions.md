@@ -97,10 +97,10 @@ flowchart TD
 * **Logic**: Inspect `plaintext[0]`. If `2..4`, delegate to `ChatMessageCodec.decode()`. If `6..8`, delegate to `FileTransferMessageCodec.decode()`.
 * **Verification**: Pure JDK unit tests with mocked/encoded wire byte payloads of all 6 message types.
 
-#### **M6b — Outbound Send Service (`OutboundMessageService`)**
+#### **M6b — Outbound Send Service (`OutboundMessageService`)** ✅ (Verified)
 * **Goal**: Create unified outbound sending service in `node-daemon`.
-* **Logic**: Wrap `ConnectionStrategy` with `CompletableFuture.runAsync`. Handle timeouts and return `ConnectivityStatus` (`DIRECT`, `RELAYED`, `UNREACHABLE`). Offload sending off Netty event loop threads.
-* **Verification**: Unit tests and hand-traced execution paths.
+* **Logic**: Wrap `ConnectionStrategy` with `CompletableFuture.supplyAsync` on a dedicated thread pool. Handle timeouts with `orTimeout` and return `ConnectivityStatus` (`DIRECT`, `RELAYED`, `UNREACHABLE`). Offload sending off Netty event loop threads to prevent callback deadlocks. Catch `RejectedExecutionException` defensively if called during or after shutdown.
+* **Verification**: 9/9 unit tests in `OutboundMessageServiceTest` covering direct-send success off-thread, fallback to relay on direct failure, skipping straight to relay when direct address is null, timeout handling on hung direct or relay attempts, non-blocking caller execution, concurrent sends, and clean shutdown handling.
 
 #### **M6c — Minimal JSON Value Model & Parser**
 * **Goal**: Build lightweight, zero-dependency JSON parser/serializer in `node-daemon`.
