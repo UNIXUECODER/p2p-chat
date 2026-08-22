@@ -102,10 +102,10 @@ flowchart TD
 * **Logic**: Wrap `ConnectionStrategy` with `CompletableFuture.supplyAsync` on a dedicated thread pool. Handle timeouts with `orTimeout` and return `ConnectivityStatus` (`DIRECT`, `RELAYED`, `UNREACHABLE`). Offload sending off Netty event loop threads to prevent callback deadlocks. Catch `RejectedExecutionException` defensively if called during or after shutdown.
 * **Verification**: 9/9 unit tests in `OutboundMessageServiceTest` covering direct-send success off-thread, fallback to relay on direct failure, skipping straight to relay when direct address is null, timeout handling on hung direct or relay attempts, non-blocking caller execution, concurrent sends, and clean shutdown handling.
 
-#### **M6c — Minimal JSON Value Model & Parser**
-* **Goal**: Build lightweight, zero-dependency JSON parser/serializer in `node-daemon`.
-* **Logic**: Parse and serialize JSON-RPC 2.0 requests, responses, and notification events. Handle string escaping, numbers, booleans, arrays, objects, and nulls defensively.
-* **Verification**: Pure JDK unit tests covering round-trip serialization, escaping, and malformed JSON rejection.
+#### **M6c — Minimal JSON Value Model & Parser** ✅ (Verified)
+* **Goal**: Build lightweight, zero-dependency JSON parser/serializer in `node-daemon` (`JsonValue`, `JsonObject`, `JsonArray`, `JsonString`, `JsonNumber`, `JsonBoolean`, `JsonNull`, `JsonCodec`).
+* **Logic**: Pure JDK recursive-descent parser and serializer matching RFC 8259. Strict number grammar with lossless raw representation (prevents $2^{53}+1$ float truncation), UTF-16 surrogate pair preservation for supplementary plane characters (e.g. emojis), control character escaping, last-value-wins for duplicate keys, insertion-order preservation via `LinkedHashMap`, defensive max nesting depth guard (32 levels) to prevent stack exhaustion, and non-coercive narrowing accessors. Deliberately scoped to the generic JSON layer only (no JSON-RPC envelope coupling until M6g).
+* **Verification**: 36/36 unit tests in `JsonCodecTest` covering round-trip serialization, nested arrays/objects, insertion order, number precision, surrogate pairs, malformed input rejection, depth limit enforcement, and narrowing type accessors.
 
 #### **M6d — Netty WebSocket Server Transport**
 * **Goal**: Implement `DaemonWebSocketServer` using Netty's `WebSocketServerProtocolHandler`.
