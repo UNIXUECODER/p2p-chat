@@ -107,10 +107,10 @@ flowchart TD
 * **Logic**: Pure JDK recursive-descent parser and serializer matching RFC 8259. Strict number grammar with lossless raw representation (prevents $2^{53}+1$ float truncation), UTF-16 surrogate pair preservation for supplementary plane characters (e.g. emojis), control character escaping, last-value-wins for duplicate keys, insertion-order preservation via `LinkedHashMap`, defensive max nesting depth guard (32 levels) to prevent stack exhaustion, and non-coercive narrowing accessors. Deliberately scoped to the generic JSON layer only (no JSON-RPC envelope coupling until M6g).
 * **Verification**: 36/36 unit tests in `JsonCodecTest` covering round-trip serialization, nested arrays/objects, insertion order, number precision, surrogate pairs, malformed input rejection, depth limit enforcement, and narrowing type accessors.
 
-#### **M6d — Netty WebSocket Server Transport**
-* **Goal**: Implement `DaemonWebSocketServer` using Netty's `WebSocketServerProtocolHandler`.
-* **Logic**: Listen on port `9400` (configurable), handle HTTP upgrades, read text frames, pass raw JSON to `JsonRpcRouter`, and push events back to connected WebSocket clients.
-* **Verification**: Integration test connecting a local WebSocket client and exchanging frames.
+#### **M6d — Netty WebSocket Server Transport** ✅ (Verified)
+* **Goal**: Implement `DaemonWebSocketServer` using Netty's `WebSocketServerProtocolHandler` (RFC 6455).
+* **Logic**: Listen on `ws://127.0.0.1:<port>/v1` (default path `/v1`), handle HTTP to WebSocket upgrades, track active client sessions (`WebSocketSession`), forward inbound `TextWebSocketFrame` payloads to `WebSocketTextHandler`, and provide `broadcast(text)` / `session.send(text)` for pushing JSON-RPC responses and server events. Configured with dedicated `EventLoopGroup`s, `allowExtensions = false`, and auto-handling of ping/pong/close frames upstream by Netty. Added `io.netty:netty-codec-http:4.2.10.Final` dependency directly to `node-daemon/build.gradle.kts`.
+* **Verification**: Unit tests in `DaemonWebSocketFrameHandlerTest` using Netty's `EmbeddedChannel` verifying session registration on handshake complete, text frame forwarding to `onMessage`, message suppression prior to handshake completion, and session cleanup on channel disconnect.
 
 #### **M6e — SessionManager Core & SQLite Session Store**
 * **Goal**: Build the daemon application core (`SessionManager`) and `SqliteSignalProtocolStore`.

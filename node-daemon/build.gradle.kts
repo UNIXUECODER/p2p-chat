@@ -10,6 +10,7 @@ dependencies {
     implementation(project(":core-storage"))
     implementation(project(":core-filetransfer"))
     implementation(project(":core-messaging"))
+    implementation("io.netty:netty-codec-http:4.2.10.Final")
 }
 
 application {
