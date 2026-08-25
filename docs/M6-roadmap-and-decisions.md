@@ -112,10 +112,13 @@ flowchart TD
 * **Logic**: Listen on `ws://127.0.0.1:<port>/v1` (default path `/v1`), handle HTTP to WebSocket upgrades, track active client sessions (`WebSocketSession`), forward inbound `TextWebSocketFrame` payloads to `WebSocketTextHandler`, and provide `broadcast(text)` / `session.send(text)` for pushing JSON-RPC responses and server events. Configured with dedicated `EventLoopGroup`s, `allowExtensions = false`, and auto-handling of ping/pong/close frames upstream by Netty. Added `io.netty:netty-codec-http:4.2.10.Final` dependency directly to `node-daemon/build.gradle.kts`.
 * **Verification**: Unit tests in `DaemonWebSocketFrameHandlerTest` using Netty's `EmbeddedChannel` verifying session registration on handshake complete, text frame forwarding to `onMessage`, message suppression prior to handshake completion, and session cleanup on channel disconnect.
 
-#### **M6e — SessionManager Core & SQLite Session Store**
-* **Goal**: Build the daemon application core (`SessionManager`) and `SqliteSignalProtocolStore`.
-* **Logic**: Apply `V002__signal_store.sql`. Implement persistent Signal store for ratchets, prekeys, and identity keys. Wrap store in `SynchronizedSignalProtocolStore`. Wire canonical `PeerId` routing and storage transaction boundaries.
-* **Verification**: Unit tests verifying OPK deletion upon consumption, Double Ratchet state survival across simulated database restarts, and multi-thread concurrency.
+#### **M6e — SessionManager Core & SQLite Session Store** ✅ (Verified)
+* **Goal**: Build the daemon application core (`SessionManager`) and `SqliteSignalProtocolStore` (`M6e-1` + `M6e-2`).
+* **Logic**: Apply `V002__signal_store.sql` & `V003__kyber_base_key_replay.sql`. Implement persistent Signal store for ratchets, prekeys, and identity keys (`M6e-1`). Wrap store in `SynchronizedSignalProtocolStore`. Build `SessionManager` (`M6e-2`) as the long-running daemon core: manages multi-peer sessions concurrently, coordinates inbound envelope decryption with `SecureSessionService`, dispatches chat/file payloads via `ApplicationMessageRouter`, enforces storage transaction boundaries (atomic conversation upsert + message persistence), enforces single-threaded inbound dedup, sends automatic delivery receipts, and coordinates outbound sends through `OutboundMessageService`.
+* **Verification**:
+  - `M6e-1`: 22/22 tests in `SqliteSignalProtocolStoreTest` verifying OPK deletion, cross-restart Double Ratchet survival, and multi-thread concurrency.
+  - `M6e-2`: 4/4 tests in `SessionManagerReceivePipelineTest` verifying message persistence, duplicate rejection with re-acknowledgment, and delivery/read receipt state updates against real SQLite.
+  - Live Multi-Session Proof: Executed `SessionManagerListenerMain` while concurrently serving multiple distinct senders (`SessionManagerSenderMain` from separate data directories) over real libp2p + PQXDH Double Ratchet transport with automatic delivery receipts.
 
 #### **M6f — Signed Discovery Record v2**
 * **Goal**: Upgrade discovery records in `core-network` and `relay-server`.

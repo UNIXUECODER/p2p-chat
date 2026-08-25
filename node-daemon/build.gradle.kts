@@ -10,6 +10,12 @@ dependencies {
     implementation(project(":core-storage"))
     implementation(project(":core-filetransfer"))
     implementation(project(":core-messaging"))
+    // M6d: required for DaemonWebSocketServer's WebSocketServerProtocolHandler/HttpServerCodec/
+    // etc. jvm-libp2p already pulls Netty transitively for its own transport, but only
+    // core-network declared it explicitly (netty-codec-http, for RelayProtocol/DiscoveryProtocol/
+    // EnvelopeProtocol's ByteBuf usage) -- as an `implementation` dependency of core-network,
+    // that doesn't flow through to node-daemon's own compile classpath. Confirmed necessary by
+    // :node-daemon:compileJava actually failing without this line, not assumed.
     implementation("io.netty:netty-codec-http:4.2.10.Final")
 }
 
@@ -336,6 +342,37 @@ tasks.register<JavaExec>("runChatSender") {
         } else {
             listOf(addrArg, bundlefileArg, messageArg, portArg)
         }
+    }
+    systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
+}
+
+// M6e-2 — the first real, multi-session daemon core, replacing ChatListenerMain/ChatSenderMain's
+// one-shot, single-peer, hardcoded-remote shape with SessionManager. Run runSessionManagerListener
+// FIRST (same reasoning as runChatListener — ChatMessagePayload.senderAddress means it needs no
+// prior knowledge of who connects), then runSessionManagerSender as many times, from as many
+// different -Pdatadir values, as you want against the SAME running listener, to prove concurrent,
+// isolated multi-peer sessions -- the actual new capability this milestone adds.
+tasks.register<JavaExec>("runSessionManagerListener") {
+    group = "p2p-chat"
+    description = "M6e-2: multi-session daemon core, listener side. Optional: -Pport=9300 -Pdatadir=.p2p-chat-data"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.p2pchat.daemon.SessionManagerListenerMain")
+    args = listOf((project.findProperty("port") as String?) ?: "9300")
+    systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
+}
+
+tasks.register<JavaExec>("runSessionManagerSender") {
+    group = "p2p-chat"
+    description = "M6e-2: multi-session daemon core, sender side. Required: -Paddr=... -Pbundlefile=... -Pmessage=... " +
+            "Optional: -Pport=9301 -Pdatadir=.p2p-chat-data"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.p2pchat.daemon.SessionManagerSenderMain")
+    val addrArg = project.findProperty("addr") as String?
+    val bundlefileArg = project.findProperty("bundlefile") as String?
+    val messageArg = project.findProperty("message") as String?
+    val portArg = (project.findProperty("port") as String?) ?: "9301"
+    if (addrArg != null && bundlefileArg != null && messageArg != null) {
+        args = listOf(addrArg, bundlefileArg, messageArg, portArg)
     }
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }
