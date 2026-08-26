@@ -22,6 +22,16 @@ import java.util.Objects;
  * against the real library) or giving core-identity a dependency on jvm-libp2p, which M0
  * deliberately avoided. Both are explicitly deferred, not forgotten.
  *
+ * <p><b>Update, M6f:</b> the first half of that tradeoff — hand-reimplementing the
+ * multihash/protobuf derivation — turned out to be verifiable after all, just not by compiling
+ * jvm-libp2p itself: {@code core-discovery}'s {@code Ed25519RecordKeys} does exactly this,
+ * checked against the official libp2p peer-id spec's own published test vector and a second,
+ * independently written implementation. That module needed the derivation for a different
+ * reason (verifying a discovery record's signer actually is the peer ID being looked up) and
+ * doesn't use it to change what this type stores — {@code PeerId} itself, and the two-value-
+ * spaces situation described above, are unchanged by this. See {@code Ed25519RecordKeys}'
+ * javadoc for the verification details.</p>
+ *
  * <p>What this type DOES fix: every module boundary that used to pass a peer identifier now
  * agrees on one Java type. That's what let {@code io.libp2p.core.PeerId} stop leaking through
  * core-network's public API (see core-network's OnEnvelopeMessage / RelayEventHandler /

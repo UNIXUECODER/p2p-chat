@@ -10,6 +10,7 @@ dependencies {
     implementation(project(":core-storage"))
     implementation(project(":core-filetransfer"))
     implementation(project(":core-messaging"))
+    implementation(project(":core-discovery"))
     // M6d: required for DaemonWebSocketServer's WebSocketServerProtocolHandler/HttpServerCodec/
     // etc. jvm-libp2p already pulls Netty transitively for its own transport, but only
     // core-network declared it explicitly (netty-codec-http, for RelayProtocol/DiscoveryProtocol/
@@ -373,6 +374,41 @@ tasks.register<JavaExec>("runSessionManagerSender") {
     val portArg = (project.findProperty("port") as String?) ?: "9301"
     if (addrArg != null && bundlefileArg != null && messageArg != null) {
         args = listOf(addrArg, bundlefileArg, messageArg, portArg)
+    }
+    systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
+}
+
+// M6f — signed discovery records: publishes/looks up a DiscoveryRecordV2 (real addresses, a
+// real PreKeyBundle, an Ed25519 signature over both) via the discovery server, replacing M3c's
+// unsigned records for anyone who also wants their pre-key bundle safely discoverable. Run
+// runPublishSignedRecord FIRST, then runLookupSignedRecord against the peer ID it prints, same
+// two-terminal shape as runPublishRecord/runLookupPeer.
+tasks.register<JavaExec>("runPublishSignedRecord") {
+    group = "p2p-chat"
+    description = "M6f: listens directly AND publishes a SIGNED record (addresses + a real PreKeyBundle) to a " +
+            "discovery server. Required: -Pdiscovery=\"/ip4/<ip>/tcp/<port>/p2p/<relay-peer-id>\". " +
+            "Optional: -Pport=9000 -Pdatadir=.p2p-chat-data"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.p2pchat.daemon.PublishSignedRecordMain")
+    val discovery = project.findProperty("discovery") as String?
+    val port = (project.findProperty("port") as String?) ?: "9000"
+    if (discovery != null) {
+        args = listOf(discovery, port)
+    }
+    systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
+}
+
+tasks.register<JavaExec>("runLookupSignedRecord") {
+    group = "p2p-chat"
+    description = "M6f: looks up and VERIFIES another peer's signed record via the discovery server. " +
+            "Required: -Pdiscovery=\"...\" -Ptarget=\"<libp2p peer ID from runPublishSignedRecord>\". " +
+            "Optional: -Pdatadir=.p2p-chat-data"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.p2pchat.daemon.LookupSignedRecordMain")
+    val discoveryArg = project.findProperty("discovery") as String?
+    val targetArg = project.findProperty("target") as String?
+    if (discoveryArg != null && targetArg != null) {
+        args = listOf(discoveryArg, targetArg)
     }
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }

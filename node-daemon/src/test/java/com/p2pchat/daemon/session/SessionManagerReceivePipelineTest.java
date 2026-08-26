@@ -79,7 +79,8 @@ class SessionManagerReceivePipelineTest {
 
         assertThat(storage.hasMessage(chat.messageId())).isTrue();
         assertThat(plaintextCacheOf(chat.messageId())).isEqualTo("hello");
-        // The auto-delivery-receipt: sent to chat.senderAddress(), not looked up any other way.
+        // The auto-delivery-receipt is dispatched asynchronously via OutboundMessageService; await receipt emission
+        awaitSentCount(1);
         assertThat(fakeNetwork.sentTo()).containsExactly(senderAddress);
         assertThat(fakeSessions.encryptedPlaintexts()).hasSize(1);
     }
@@ -97,6 +98,7 @@ class SessionManagerReceivePipelineTest {
 
         assertThat(countMessageRows(chat.messageId())).isEqualTo(1); // not inserted twice
         // Acknowledged both times -- the sender has no way to know their first ack was lost.
+        awaitSentCount(2);
         assertThat(fakeNetwork.sentTo()).hasSize(2);
     }
 
@@ -164,6 +166,13 @@ class SessionManagerReceivePipelineTest {
             statement.execute("INSERT INTO messages (message_id, conversation_id, sender_peer_id, " +
                     "hlc_timestamp, content_type, delivery_state, created_at) VALUES ('" + messageId +
                     "', 'direct-a-b', '" + ownPeerId.value() + "', '" + hlcTimestamp + "', 'text/plain', 'SENDING', 0)");
+        }
+    }
+
+    private void awaitSentCount(int expectedCount) throws Exception {
+        long deadline = System.currentTimeMillis() + 3000;
+        while (fakeNetwork.sentTo().size() < expectedCount && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
         }
     }
 }

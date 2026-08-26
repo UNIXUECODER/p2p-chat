@@ -4,6 +4,7 @@ include("core-identity")
 include("core-model")
 include("core-network")
 include("core-crypto")
+include("core-discovery")
 include("core-storage")
 include("core-filetransfer")
 include("core-messaging")
@@ -25,7 +26,15 @@ include("node-daemon")
 // core-messaging (M5a): HybridLogicalClock, proven in isolation. Real 1:1 send/receive wiring
 // lands here incrementally across M5b/M5c/M5d — see the M5a section of README.md.
 
+// core-discovery (M6f): DiscoveryRecordV2 — the client-side record shape, signing, and
+// verification logic architecture-spec.md §5 already sketched a DiscoveryService interface
+// for. Scoped narrower than that full sketch for now (record shape + crypto only, not the
+// findPeer/announce orchestration interface itself — see the M6f section of README.md for
+// why that's still open). Depends only on core-model; deliberately not on core-network (stays
+// independently testable, unlike most M6 code — see this milestone's own README section for
+// what "independently testable" bought here) or core-identity (accepts raw Ed25519 key
+// material as parameters instead, matching PeerNetworkService.start()'s existing convention).
+
 // Modules from the architecture spec not yet scaffolded — added as each
 // milestone is reached, per docs/architecture-spec.md §17:
-// include("core-discovery")
 // include("core-groups")
