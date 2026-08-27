@@ -274,6 +274,25 @@ public final class SessionManager implements AutoCloseable {
     }
 
     private void handleChatMessagePayload(PeerId sender, ChatMessagePayload chat) {
+        // Regression fix: the pre-M6 cleanup pass added this exact checkDrift-before-update gate
+        // to ChatListenerMain/ChatSenderMain (see README's M5e section), on the reasoning that an
+        // implausible remote timestamp should reject the message outright -- not persisted, not
+        // acknowledged, clock not advanced -- rather than let it corrupt this node's own clock or
+        // sit in message history with a bogus HLC order. SessionManager (M6e-2), which superseded
+        // those demo Mains as the real daemon core, never picked the gate up: the block this
+        // replaces called clock.update() inside a catch for RemoteTimestampRejectedException, but
+        // update() can never throw that -- only checkDrift() does -- so that catch was silently
+        // dead code and every remote timestamp was accepted unconditionally. Fixed by calling
+        // checkDrift() first, before dedup and before persistence, matching ChatListenerMain's own
+        // ordering exactly.
+        try {
+            clock.checkDrift(chat.hlcTimestamp());
+        } catch (HybridLogicalClock.RemoteTimestampRejectedException e) {
+            System.err.println("[session-manager] REJECTED message " + chat.messageId() + " from " + sender
+                    + " -- clock drift too large: " + e.getMessage());
+            return;
+        }
+
         SignalProtocolAddress remote = new SignalProtocolAddress(sender.value(), 1);
         String conversationId = deriveDirectConversationId(ownPeerId.value(), sender.value());
 
@@ -285,13 +304,9 @@ public final class SessionManager implements AutoCloseable {
         // inboundExecutor is single-threaded -- see class Javadoc.
         boolean isDuplicate = storage.hasMessage(chat.messageId());
 
-        try {
-            clock.update(chat.hlcTimestamp());
-        } catch (HybridLogicalClock.RemoteTimestampRejectedException e) {
-            // The claimed timestamp is suspect, not the message content -- reject the clock
-            // update only; still process and persist the message itself.
-            System.err.println("[session-manager] rejected clock update from " + sender + ": " + e.getMessage());
-        }
+        // checkDrift() has already gated untrusted input above, so update() itself can never
+        // throw RemoteTimestampRejectedException here -- safe to call unconditionally.
+        clock.update(chat.hlcTimestamp());
 
         if (!isDuplicate) {
             // The storage-transaction-boundaries decision from the original M6 open-decisions

@@ -80,13 +80,16 @@ CREATE TABLE IF NOT EXISTS signal_kyber_base_keys_seen (
 
 ```mermaid
 flowchart TD
-    M6a["M6a: Shared Decrypted Dispatcher<br/>(Pure JDK - ApplicationMessageRouter)"] --> M6b
-    M6b["M6b: Outbound Send Service<br/>(ConnectionStrategy + Async + Status)"] --> M6c
-    M6c["M6c: Minimal JSON Model & Parser<br/>(Pure JDK - JSON-RPC 2.0 Envelopes)"] --> M6d
-    M6d["M6d: Netty WebSocket Server<br/>(RFC 6455 Transport - Port 9400)"] --> M6e
-    M6e["M6e: SessionManager & Signal Store<br/>(Multi-session Core + SqliteSignalProtocolStore + V002)"] --> M6f
-    M6f["M6f: Signed Discovery Record v2 ✅<br/>(Ed25519 Signed Prekey & Address Records)"] --> M6g
-    M6g["M6g: JSON-RPC Method Surface<br/>(Methods + Push Events + Error Enum)"] --> M6h
+    M6a["M6a: Shared Decrypted Dispatcher ✅"] --> M6b
+    M6b["M6b: Outbound Send Service ✅"] --> M6c
+    M6c["M6c: Minimal JSON Model & Parser ✅"] --> M6d
+    M6d["M6d: Netty WebSocket Server ✅"] --> M6e
+    M6e["M6e: SessionManager & Signal Store ✅"] --> M6f
+    M6f["M6f: Signed Discovery Record v2 ✅"] --> M6g1
+    M6g1["M6g-1: StorageService Read-Side<br/>(listConversations, listContacts, etc.)"] --> M6g2
+    M6g2["M6g-2: Peer Routing Table + Invite Code<br/>(PeerRoutingTable, InviteCodeCodec, ContactService)"] --> M6g3
+    M6g3["M6g-3: Event Emission + File Transfer Handler<br/>(DaemonEventListener, DefaultFileTransferHandler)"] --> M6g4
+    M6g4["M6g-4: JSON-RPC Method Surface<br/>(JsonRpcRouter + Push Events + DaemonErrorCode)"] --> M6h
     M6h["M6h: DaemonMain Composition Root<br/>(Gradle task :node-daemon:runDaemon + E2E Test)"]
 ```
 
@@ -126,12 +129,35 @@ flowchart TD
 * **Verification**: 19/19 real, executed checks — not hand-traced, not stub-compiled — run against the actual production source via a standalone harness (this sandbox has no Maven Central access for JUnit/AssertJ; the equivalent `Ed25519RecordKeysTest`/`DiscoveryRecordCodecTest`/`DiscoveryRegistryTest` JUnit files are included for a real `./gradlew test` run). Covers: the *official* libp2p peer-id spec's own published Ed25519 test vector (byte-for-byte match), 5 real JDK-generated keypairs round-tripped through X.509 extraction, signing, and verification, full record round-trip (populated and minimal), tampered-record rejection, cross-peer signature substitution rejection (`PEER_ID_MISMATCH` — the actual MITM scenario this milestone exists to close), expired-record rejection, truncated/garbage/implausible-count input rejection, `decodeUnverified`'s deliberate non-verification, and `DiscoveryRegistry`'s expiry-withholding including backward compatibility with pre-M6f (non-V2) payloads.
 * **Explicitly out of scope, named rather than silently dropped**: pre-key bundle *refresh cadence* — the concrete gap M6e-2 testing surfaced above. The record format doesn't block a fix (`publish()` is a plain overwrite; republishing a fresh signed record is just calling this code again), but nothing yet decides *when* to call it — that needs a live daemon loop to run a schedule from, which doesn't exist until M6g/M6h. Not solved here; said so, on purpose.
 
-#### **M6g — JSON-RPC Method Surface, Push Events & Error Vocabulary**
-* **Goal**: Implement `JsonRpcRouter` and standard methods/events.
-* **Logic**: Map RPC methods (`chat.send`, `chat.listMessages`, `file.offer`, `peers.discover`) and server push events (`event.messageReceived`, `event.deliveryStateChanged`, `event.fileProgress`). Map failures to the sealed `DaemonErrorCode` enum.
-* **Verification**: Unit tests testing method invocation, parameter extraction, error response formatting, and push event emission.
+#### **M6g — JSON-RPC Method Surface, Push Events & Error Vocabulary (revised)**
+
+> **Revised post-M6f:** A gap analysis (`docs/M6g-gap-analysis-and-plan.md`) revealed that M6g's original scope assumed backend capabilities that don't exist yet. M6g is now split into four sub-milestones following the M6e-1/M6e-2 precedent.
+
+##### M6g-1 — StorageService Read-Side Expansion
+* **Goal**: Fill the read-side gaps in `StorageService` that every `*.list` RPC method needs.
+* **New methods**: `listConversations()`, `listContacts()`, `getConversation(String)`, `getContact(PeerId)`.
+* **Scope**: Pure SQL reads against existing tables. No schema changes. No new dependencies.
+* **Verification**: Unit tests in `SqliteStorageServiceTest` against real in-memory SQLite.
+
+##### M6g-2 — Peer Routing Table + Invite Code Resolution
+* **Goal**: Build the peer-resolution layer that `messages.send` and `contacts.add` need.
+* **New code**: `PeerRoute` record, `PeerRoutingTable` (in-memory + persistent), `V004__peer_routes.sql` migration, `InviteCodeCodec` (base64url JSON: peer ID + optional discovery addr + optional display name), `ContactService` (orchestrates `contacts.add`: decode → discovery lookup → verify signed record → save contact → populate routing table).
+* **Verification**: Unit tests for `InviteCodeCodec`, `PeerRoutingTable`, and `ContactService` with fake discovery.
+
+##### M6g-3 — SessionManager Event Emission + FileTransferHandler Implementation
+* **Goal**: Give `SessionManager` a way to notify the WebSocket/JSON-RPC layer, and wire in file-transfer lifecycle.
+* **New code**: `DaemonEventListener` interface (`onMessageReceived`, `onDeliveryStateChanged`, `onFileOfferReceived`, `onFileTransferProgress`, `onNetworkStatusChanged`). `SessionManager` gains event emission call sites, `sendFile(PeerId, Path)`, and `acceptFileTransfer(transferId, savePath)`. `DefaultFileTransferHandler` consolidates `FileSenderMain`/`FileReceiverMain`'s proven chunk logic.
+* **Scope note**: Largest sub-milestone. Porting proven logic, not inventing new mechanics. `files.cancel` deferred to M7.
+* **Verification**: Unit tests for event emission and `DefaultFileTransferHandler` chunk logic against real SQLite + `FileChunker`/`ChunkCipher`.
+
+##### M6g-4 — JSON-RPC Router, Method Dispatch, Push Events, Error Vocabulary
+* **Goal**: The original M6g scope — now buildable because M6g-1 through M6g-3 provided everything it needs.
+* **New code**: `JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError` records (on top of M6c's `JsonValue`/`JsonCodec`). `DaemonErrorCode` enum (`PEER_UNREACHABLE`, `RELAY_UNAVAILABLE`, `MALFORMED_RECORD`, `CRYPTO_FAILURE`, `DUPLICATE_MESSAGE`, `STORAGE_FAILURE`, `INVALID_REQUEST`, `METHOD_NOT_FOUND`, `UNKNOWN_CONVERSATION`, `UNKNOWN_CONTACT`). `JsonRpcRouter` implements both `WebSocketTextHandler` (request dispatch) and `DaemonEventListener` (push event emission via `DaemonWebSocketServer.broadcast`).
+* **Method names**: §7's original namespace (`messages.send`, `messages.history`, etc.), not the M6-roadmap's earlier alternatives. `conversations.createGroup` returns `METHOD_NOT_FOUND` ("available in a future version") until M8. `files.cancel` returns `METHOD_NOT_FOUND` until M7.
+* **Verification**: Unit tests for JSON-RPC envelope parsing, each method handler (mock backend), error formatting, and push event content.
 
 #### **M6h — `DaemonMain` Composition Root & Automated E2E Test**
 * **Goal**: Assemble the complete daemon process and Gradle task `:node-daemon:runDaemon`.
-* **Logic**: Wire `DaemonWebSocketServer` + `JsonRpcRouter` + `SessionManager` + `OutboundMessageService` + `SqliteStorageService` + `Libp2pNetworkService` in `DaemonMain`. Create an end-to-end integration test where two daemon processes exchange chat messages and file transfers via JSON-RPC.
-* **Verification**: Automated integration test execution confirming full end-to-end functionality.
+* **Logic**: Wire `DaemonWebSocketServer` + `JsonRpcRouter` + `SessionManager` + `OutboundMessageService` + `SqliteStorageService` + `Libp2pNetworkService` + `PeerRoutingTable` + `ContactService` + `DefaultFileTransferHandler` + `DaemonEventListener` in `DaemonMain`. Also picks up the deferred items from M6e-2 that require a live daemon loop: relay-delivered inbound reception (wire `SessionManager` as `RelayEventHandler`), pre-key bundle refresh cadence (scheduled republication of signed discovery records), and the automated E2E integration test (two daemon processes exchange chat messages and file transfers via JSON-RPC).
+* **Verification**: Automated integration test confirming full end-to-end functionality across two daemon processes.
+

@@ -198,6 +198,81 @@ class SqliteStorageServiceTest {
         assertThat(stateOf(messages, "m-bob")).isEqualTo(DeliveryState.DELIVERED); // Bob's own — untouched
     }
 
+    @Test
+    void listContactsReturnsAlphabeticalOrderAndHandlesEmptyTable() {
+        assertThat(storageService.listContacts()).isEmpty();
+
+        storageService.saveContact(new Contact(new PeerId("peer-3"), "Charlie", false, 300));
+        storageService.saveContact(new Contact(new PeerId("peer-1"), "alice", true, 100));
+        storageService.saveContact(new Contact(new PeerId("peer-4"), "bob", false, 250));
+        storageService.saveContact(new Contact(new PeerId("peer-2"), "Bob", true, 200));
+
+        List<Contact> contacts = storageService.listContacts();
+        assertThat(contacts).hasSize(4);
+        assertThat(contacts.get(0).displayName()).isEqualTo("alice");
+        assertThat(contacts.get(0).peerId()).isEqualTo(new PeerId("peer-1"));
+        // Case-insensitive sort, peer_id ASC tie-breaker: peer-2 before peer-4
+        assertThat(contacts.get(1).peerId()).isEqualTo(new PeerId("peer-2"));
+        assertThat(contacts.get(2).peerId()).isEqualTo(new PeerId("peer-4"));
+        assertThat(contacts.get(3).displayName()).isEqualTo("Charlie");
+    }
+
+    @Test
+    void getContactReturnsMatchingContactOrNull() {
+        PeerId peerId = new PeerId("peer-alice");
+        assertThat(storageService.getContact(peerId)).isNull();
+
+        Contact contact = new Contact(peerId, "Alice", true, 12345L);
+        storageService.saveContact(contact);
+
+        Contact loaded = storageService.getContact(peerId);
+        assertThat(loaded).isNotNull();
+        assertThat(loaded.peerId()).isEqualTo(peerId);
+        assertThat(loaded.displayName()).isEqualTo("Alice");
+        assertThat(loaded.verified()).isTrue();
+        assertThat(loaded.addedAt()).isEqualTo(12345L);
+    }
+
+    @Test
+    void getConversationReturnsMatchingConversationOrNull() {
+        assertThat(storageService.getConversation("c-missing")).isNull();
+
+        Conversation conv = new Conversation("c-test", ConversationType.DIRECT, "Direct Chat", 54321L);
+        storageService.saveConversation(conv);
+
+        Conversation loaded = storageService.getConversation("c-test");
+        assertThat(loaded).isNotNull();
+        assertThat(loaded.conversationId()).isEqualTo("c-test");
+        assertThat(loaded.type()).isEqualTo(ConversationType.DIRECT);
+        assertThat(loaded.name()).isEqualTo("Direct Chat");
+        assertThat(loaded.createdAt()).isEqualTo(54321L);
+    }
+
+    @Test
+    void listConversationsOrdersByMostRecentlyActiveMessageFirst() {
+        assertThat(storageService.listConversations()).isEmpty();
+
+        // 4 conversations: 2 with messages (different activity timestamps), 2 without (different created_at)
+        storageService.saveConversation(new Conversation("c-inactive", ConversationType.DIRECT, "Inactive", 500));
+        storageService.saveConversation(new Conversation("c-newer-inactive", ConversationType.DIRECT, "Newer Inactive", 800));
+        storageService.saveConversation(new Conversation("c-old-activity", ConversationType.DIRECT, "Old Active", 100));
+        storageService.saveConversation(new Conversation("c-recent-activity", ConversationType.DIRECT, "Recent Active", 200));
+
+        PeerId sender = new PeerId("sender");
+        // hlc timestamp: 19 digits physical time, '-' counter '-' node
+        String hlc1000 = "0000000000000001000-0000000000-sender";
+        String hlc2000 = "0000000000000002000-0000000000-sender";
+
+        storageService.saveMessage(new Message("m1", "c-old-activity", sender, new DeviceId("0"),
+                hlc1000, "text/plain", "hello".getBytes(), DeliveryState.SENT, 1000));
+        storageService.saveMessage(new Message("m2", "c-recent-activity", sender, new DeviceId("0"),
+                hlc2000, "text/plain", "world".getBytes(), DeliveryState.SENT, 2000));
+
+        List<Conversation> ordered = storageService.listConversations();
+        assertThat(ordered).extracting(Conversation::conversationId)
+                .containsExactly("c-recent-activity", "c-old-activity", "c-newer-inactive", "c-inactive");
+    }
+
     private static DeliveryState stateOf(List<Message> messages, String messageId) {
         return messages.stream()
                 .filter(m -> m.messageId().equals(messageId))

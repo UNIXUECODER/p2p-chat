@@ -380,23 +380,27 @@ The `EncryptedFrame` format carried inside Envelope payloads: `[1 byte: 0x01=Pre
 
 The Electron app connects to `ws://127.0.0.1:<port>/v1` on launch. Requests/responses are JSON-RPC 2.0; server-initiated events use the same socket with a reserved `event.*` method namespace instead of an `id`.
 
+> **Amendment (post-M6f gap analysis):** a systematic review of this table against the actual backend capabilities M6a–M6f delivered revealed that several methods assume backend infrastructure that doesn't exist yet (read-side storage queries, peer address resolution, event emission, file-transfer integration). The gaps, resolved design decisions, and a revised implementation plan (M6g split into M6g-1 through M6g-4) are captured in `docs/M6g-gap-analysis-and-plan.md`. This table remains the canonical API contract the frontend builds against; the gap analysis document captures the backend implementation plan to deliver it.
+
 **Methods**
 
-| Method | Params | Returns |
-|---|---|---|
-| `identity.create` | `{ displayName }` | `Identity` |
-| `identity.get` | `{}` | `Identity` |
-| `contacts.add` | `{ inviteCode }` | `Contact` |
-| `contacts.list` | `{}` | `Contact[]` |
-| `conversations.list` | `{}` | `Conversation[]` |
-| `conversations.createGroup` | `{ name, memberIds[] }` | `Conversation` |
-| `messages.send` | `{ conversationId, contentType, content }` | `{ messageId }` |
-| `messages.history` | `{ conversationId, cursor, limit }` | `Message[]` |
-| `files.send` | `{ conversationId, filePath }` | `{ transferId }` |
-| `files.accept` | `{ transferId, savePath }` | `{}` |
-| `files.cancel` | `{ transferId }` | `{}` |
-| `network.status` | `{}` | `NetworkStatus` |
-| `network.connectedPeers` | `{}` | `PeerInfo[]` |
+| Method | Params | Returns | Scope |
+|---|---|---|---|
+| `identity.create` | `{ displayName }` | `Identity` | M6g-4 |
+| `identity.get` | `{}` | `Identity` | M6g-4 |
+| `contacts.add` | `{ inviteCode }` | `Contact` | M6g-2 / M6g-4 |
+| `contacts.list` | `{}` | `Contact[]` | M6g-1 / M6g-4 |
+| `conversations.list` | `{}` | `Conversation[]` | M6g-1 / M6g-4 |
+| `conversations.createGroup` | `{ name, memberIds[] }` | `Conversation` | **M8** (CRDT + sender-key) |
+| `messages.send` | `{ conversationId, contentType, content }` | `{ messageId }` | M6g-2 / M6g-4 |
+| `messages.history` | `{ conversationId, cursor, limit }` | `Message[]` | M6g-4 |
+| `files.send` | `{ conversationId, filePath }` | `{ transferId }` | M6g-3 / M6g-4 |
+| `files.accept` | `{ transferId, savePath }` | `{}` | M6g-3 / M6g-4 |
+| `files.cancel` | `{ transferId }` | `{}` | **M7** (needs UI-driven interruption) |
+| `network.status` | `{}` | `NetworkStatus` | M6g-4 |
+| `network.connectedPeers` | `{}` | `PeerInfo[]` | M6g-2 / M6g-4 |
+
+**Invite code format (resolved post-M6f):** `contacts.add`'s `inviteCode` parameter is a base64url-encoded JSON payload: `{ "p": "<libp2p peer ID>", "d": "<discovery/relay multiaddr>", "n": "<display name>" }`. Only `p` is required. The code does *not* contain a pre-key bundle — bundle exchange happens via signed discovery records (M6f), not the invite code itself. See `docs/M6g-gap-analysis-and-plan.md §2.1` for the full resolution flow.
 
 **Example request/response**
 

@@ -4,6 +4,7 @@ import com.p2pchat.model.DeviceId;
 import com.p2pchat.model.PeerId;
 import com.p2pchat.storage.model.Contact;
 import com.p2pchat.storage.model.Conversation;
+import com.p2pchat.storage.model.ConversationType;
 import com.p2pchat.storage.model.DeliveryState;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
@@ -16,8 +17,10 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.function.Supplier;
 
@@ -206,6 +209,124 @@ public final class SqliteStorageService implements StorageService {
             statement.setString(4, readUpToHlcTimestamp);
             statement.setString(5, DeliveryState.READ.name());
         });
+    }
+
+    @Override
+    public List<Conversation> listConversations() {
+        List<Conversation> conversations = new ArrayList<>();
+        try (PreparedStatement statement = database.connection().prepareStatement(
+                "SELECT conversation_id, type, name, created_at FROM conversations")) {
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    conversations.add(mapConversation(resultSet));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to list conversations", e);
+        }
+
+        // Most recent hlc_timestamp per conversation, in one query rather than one per
+        // conversation — same "don't do N+1 queries when a single aggregate covers it" instinct
+        // as missingChunks' own single received-set query below. A conversation absent from this
+        // map has no messages yet.
+        Map<String, String> latestHlcByConversation = new HashMap<>();
+        try (PreparedStatement statement = database.connection().prepareStatement(
+                "SELECT conversation_id, MAX(hlc_timestamp) AS latest FROM messages GROUP BY conversation_id")) {
+            try (ResultSet resultSet = statement.executeQuery()) {
+                while (resultSet.next()) {
+                    latestHlcByConversation.put(resultSet.getString("conversation_id"), resultSet.getString("latest"));
+                }
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to compute latest activity per conversation", e);
+        }
+
+        conversations.sort((a, b) -> {
+            long keyA = activityKeyMillis(a, latestHlcByConversation);
+            long keyB = activityKeyMillis(b, latestHlcByConversation);
+            int byActivity = Long.compare(keyB, keyA); // most-recent first
+            return byActivity != 0 ? byActivity : a.conversationId().compareTo(b.conversationId());
+        });
+        return conversations;
+    }
+
+    /**
+     * The sort key {@link #listConversations} orders by: the physical-time component of the
+     * conversation's most recent message, or {@code createdAt} if it has none yet. Safe to read
+     * just the leading 19 characters of {@code hlc_timestamp} as epoch millis specifically
+     * because {@code core-messaging.HlcTimestamp#toString()}'s fixed-width zero-padded encoding
+     * puts the physical component there unconditionally (19 digits, then a {@code '-'}) — the
+     * same encoding fact {@link #markMessagesReadUpTo} already relies on for its own TEXT
+     * comparison, not a new assumption introduced here. Not parsed via {@code HlcTimestamp}
+     * itself: core-storage has no dependency on core-messaging, and a 19-character substring
+     * parse doesn't need one.
+     */
+    private static long activityKeyMillis(Conversation conversation, Map<String, String> latestHlcByConversation) {
+        String latest = latestHlcByConversation.get(conversation.conversationId());
+        if (latest == null) {
+            return conversation.createdAt();
+        }
+        return Long.parseLong(latest.substring(0, 19));
+    }
+
+    @Override
+    public List<Contact> listContacts() {
+        List<Contact> results = new ArrayList<>();
+        String sql = "SELECT peer_id, display_name, verified, added_at FROM contacts " +
+                "ORDER BY display_name COLLATE NOCASE ASC, peer_id ASC";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            while (resultSet.next()) {
+                results.add(mapContact(resultSet));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to list contacts", e);
+        }
+        return results;
+    }
+
+    @Override
+    public Conversation getConversation(String conversationId) {
+        String sql = "SELECT conversation_id, type, name, created_at FROM conversations WHERE conversation_id = ?";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, conversationId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? mapConversation(resultSet) : null;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to get conversation " + conversationId, e);
+        }
+    }
+
+    @Override
+    public Contact getContact(PeerId peerId) {
+        String sql = "SELECT peer_id, display_name, verified, added_at FROM contacts WHERE peer_id = ?";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, peerId.value());
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? mapContact(resultSet) : null;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to get contact " + peerId, e);
+        }
+    }
+
+    private static Conversation mapConversation(ResultSet resultSet) throws SQLException {
+        return new Conversation(
+                resultSet.getString("conversation_id"),
+                ConversationType.valueOf(resultSet.getString("type")),
+                resultSet.getString("name"),
+                resultSet.getLong("created_at")
+        );
+    }
+
+    private static Contact mapContact(ResultSet resultSet) throws SQLException {
+        return new Contact(
+                new PeerId(resultSet.getString("peer_id")),
+                resultSet.getString("display_name"),
+                resultSet.getInt("verified") != 0,
+                resultSet.getLong("added_at")
+        );
     }
 
     @Override

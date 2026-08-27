@@ -103,6 +103,29 @@ class SessionManagerReceivePipelineTest {
     }
 
     @Test
+    void aMessageWithImplausibleFutureDriftIsRejectedNotPersistedNorAcknowledged() throws Exception {
+        // Regression test for the bug fixed alongside M6g-1: SessionManager previously never
+        // called HybridLogicalClock.checkDrift at all (see that method's own call site in
+        // handleChatMessagePayload for the full history), so a message claiming a timestamp far
+        // in the future was accepted unconditionally. ChatListenerMain's own equivalent gate
+        // fully rejects such a message -- not persisted, not acknowledged, clock not advanced --
+        // and this pins SessionManager to that same behavior.
+        long tooFarFuture = System.currentTimeMillis() + HybridLogicalClock.DEFAULT_MAX_FUTURE_DRIFT.toMillis() + 60_000;
+        ChatMessagePayload chat = new ChatMessagePayload(
+                "a1a1a1a1-0000-4000-8000-000000000005", senderAddress,
+                new HlcTimestamp(tooFarFuture, 0, senderPeerId.value()), "direct-a-b", "text/plain",
+                "from the future".getBytes(StandardCharsets.UTF_8), null);
+
+        sessionManager.handleDecryptedPlaintext(senderPeerId, ChatMessageCodec.encode(chat));
+
+        assertThat(storage.hasMessage(chat.messageId())).isFalse();
+        // Unlike the other tests, nothing is ever queued to send for a rejected message -- no
+        // async completion to await, but a short grace period guards against a delayed false pass.
+        Thread.sleep(200);
+        assertThat(fakeNetwork.sentTo()).isEmpty();
+    }
+
+    @Test
     void aDeliveryReceiptUpdatesTheOriginalMessagesDeliveryState() throws Exception {
         // A message THIS node sent earlier, now being acknowledged by its recipient.
         insertRawSentMessage("a1a1a1a1-0000-4000-8000-000000000003", "SENDING");

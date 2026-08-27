@@ -36,6 +36,14 @@ import java.util.function.Supplier;
  * targeted methods rather than one general "patch a message" method, matching this interface's
  * existing convention (see {@link #markChunkReceived}) of adding exactly the operation a real
  * caller needs, not a broader one guessed at in advance.
+ *
+ * <p><b>M6g-1 update:</b> {@link #listConversations}, {@link #listContacts},
+ * {@link #getConversation}, and {@link #getContact} added — the read-side gap identified in
+ * {@code docs/M6g-gap-analysis-and-plan.md §1.1/§1.3}: every prior milestone only ever needed to
+ * write contacts/conversations, never list or look one up by id, so those methods never existed.
+ * The JSON-RPC surface (M6g-4) needs all four directly (`contacts.list`, `conversations.list`),
+ * and {@code ContactService} (M6g-2) needs {@link #getContact} specifically to make
+ * {@code contacts.add} idempotent — see that class's own Javadoc once it exists.
  */
 public interface StorageService {
 
@@ -127,6 +135,27 @@ public interface StorageService {
      * relies on without justification.
      */
     void markMessagesReadUpTo(String conversationId, PeerId senderPeerId, String readUpToHlcTimestamp);
+
+    /**
+     * M6g-1: every conversation, most-recently-active first. "Active" means the {@code
+     * hlc_timestamp} of the conversation's most recent message if it has any messages yet, or
+     * {@code created_at} otherwise — a freshly-seeded conversation with no messages (see
+     * {@link #saveConversation}'s upsert note on why that's a real, common state) still needs a
+     * deterministic, sensible position in the list rather than sorting arbitrarily or being
+     * excluded. Two conversations with no messages sort by {@code created_at} relative to each
+     * other; a conversation with messages always sorts ahead of one without, regardless of when
+     * either was created, since "most recently active" is about activity, not age.
+     */
+    List<Conversation> listConversations();
+
+    /** M6g-1: every contact, alphabetical by display name (case-insensitive), then by {@code peerId} to break ties deterministically. */
+    List<Contact> listContacts();
+
+    /** M6g-1: a single conversation by id, or {@code null} if none exists — never throws for a missing id. */
+    Conversation getConversation(String conversationId);
+
+    /** M6g-1: a single contact by peer id, or {@code null} if none exists — never throws for a missing id. */
+    Contact getContact(PeerId peerId);
 
     /** Runs {@code work} inside a single SQLite transaction, committing on normal return and rolling back if {@code work} throws. */
     <T> T runInTransaction(Supplier<T> work);
