@@ -7,6 +7,7 @@ import com.p2pchat.storage.model.DeliveryState;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.Pagination;
+import com.p2pchat.storage.model.PeerRoute;
 
 import java.util.List;
 import java.util.function.Supplier;
@@ -44,6 +45,14 @@ import java.util.function.Supplier;
  * The JSON-RPC surface (M6g-4) needs all four directly (`contacts.list`, `conversations.list`),
  * and {@code ContactService} (M6g-2) needs {@link #getContact} specifically to make
  * {@code contacts.add} idempotent — see that class's own Javadoc once it exists.
+ *
+ * <p><b>M6g-2 update:</b> {@link #upsertPeerRoute}, {@link #getPeerRoute}, and
+ * {@link #listPeerRoutes} added — the persistence half of the peer routing table
+ * ({@code docs/M6g-gap-analysis-and-plan.md §2.3}). {@code PeerRoute} itself lives in {@code
+ * core-storage.model} alongside {@link Contact}/{@link Conversation}, not in {@code node-daemon}
+ * as that section first sketched — see {@code PeerRoute}'s own Javadoc for why that's a better
+ * fit for what turned out to be a plain persisted row, and {@code node-daemon.PeerRoutingTable}
+ * for the daemon-level class that actually still lives where the plan put it.
  */
 public interface StorageService {
 
@@ -156,6 +165,31 @@ public interface StorageService {
 
     /** M6g-1: a single contact by peer id, or {@code null} if none exists — never throws for a missing id. */
     Contact getContact(PeerId peerId);
+
+    /**
+     * M6g-2: records (or refreshes) what this daemon currently knows about reaching {@code
+     * observed.peerId()}. Merge semantics, not a blind overwrite: any field left {@code null} on
+     * {@code observed} preserves whatever this daemon already had stored for that field, rather
+     * than erasing it. Necessary because the real call sites — a discovery lookup, an inbound
+     * message's {@code senderAddress}, {@code contacts.add}, a relay registration — each learn a
+     * different subset of a peer's route at different times; a blind overwrite from any one of
+     * them would silently discard whatever the others had already contributed. {@code lastSeen}
+     * is the one exception — always taken from {@code observed}, never preserved, since every
+     * call to this method represents a real, fresh observation worth recording as such.
+     *
+     * <p>The first call for a given {@code peerId} has nothing to merge against, so it behaves
+     * as a plain insert of exactly what {@code observed} contains, {@code null}s included.
+     *
+     * @return the row as it exists after the merge — saves a caller a follow-up {@link
+     *         #getPeerRoute} just to see the result.
+     */
+    PeerRoute upsertPeerRoute(PeerRoute observed);
+
+    /** M6g-2: a single peer route by peer id, or {@code null} if this daemon has never observed one. */
+    PeerRoute getPeerRoute(PeerId peerId);
+
+    /** M6g-2: every known peer route, most-recently-observed first. */
+    List<PeerRoute> listPeerRoutes();
 
     /** Runs {@code work} inside a single SQLite transaction, committing on normal return and rolling back if {@code work} throws. */
     <T> T runInTransaction(Supplier<T> work);

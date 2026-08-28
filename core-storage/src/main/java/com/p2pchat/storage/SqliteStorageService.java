@@ -9,6 +9,7 @@ import com.p2pchat.storage.model.DeliveryState;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.Pagination;
+import com.p2pchat.storage.model.PeerRoute;
 import com.p2pchat.storage.model.TransferState;
 
 import java.nio.charset.StandardCharsets;
@@ -326,6 +327,87 @@ public final class SqliteStorageService implements StorageService {
                 resultSet.getString("display_name"),
                 resultSet.getInt("verified") != 0,
                 resultSet.getLong("added_at")
+        );
+    }
+
+    @Override
+    public PeerRoute upsertPeerRoute(PeerRoute observed) {
+        // COALESCE-on-null merge, not a blind overwrite -- see this method's own interface
+        // Javadoc for why: the real call sites (discovery lookup, an inbound message's
+        // senderAddress, contacts.add, a relay registration) each learn a different subset of a
+        // route at different times, so a null field on `observed` means "this call didn't learn
+        // anything new here," not "clear it." last_seen is the one field taken from `excluded`
+        // unconditionally -- every call is a real, fresh observation, so it should always win.
+        String sql = "INSERT INTO peer_routes (peer_id, direct_multiaddr, relay_multiaddr, display_name, pre_key_bundle, last_seen) " +
+                "VALUES (?, ?, ?, ?, ?, ?) " +
+                "ON CONFLICT(peer_id) DO UPDATE SET " +
+                "direct_multiaddr = COALESCE(excluded.direct_multiaddr, peer_routes.direct_multiaddr), " +
+                "relay_multiaddr = COALESCE(excluded.relay_multiaddr, peer_routes.relay_multiaddr), " +
+                "display_name = COALESCE(excluded.display_name, peer_routes.display_name), " +
+                "pre_key_bundle = COALESCE(excluded.pre_key_bundle, peer_routes.pre_key_bundle), " +
+                "last_seen = excluded.last_seen";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, observed.peerId().value());
+            statement.setString(2, observed.directMultiaddr());
+            statement.setString(3, observed.relayMultiaddr());
+            statement.setString(4, observed.displayName());
+            statement.setBytes(5, observed.preKeyBundle());
+            statement.setLong(6, observed.lastSeen());
+            statement.executeUpdate();
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to upsert peer route for " + observed.peerId(), e);
+        }
+        // A caller passing a freshly-observed route almost always wants to know the merged
+        // result, not just "it worked" -- one query here saves every caller a follow-up
+        // getPeerRoute just to see what actually landed after the merge (see interface Javadoc).
+        PeerRoute merged = getPeerRoute(observed.peerId());
+        if (merged == null) {
+            // Would mean the INSERT above silently didn't happen -- genuinely unexpected, not a
+            // normal outcome any caller should have to handle, so this fails loudly rather than
+            // returning null and letting a NullPointerException surface somewhere unrelated.
+            throw new IllegalStateException("Upserted peer route for " + observed.peerId() + " but it cannot be read back");
+        }
+        return merged;
+    }
+
+    @Override
+    public PeerRoute getPeerRoute(PeerId peerId) {
+        String sql = "SELECT peer_id, direct_multiaddr, relay_multiaddr, display_name, pre_key_bundle, last_seen " +
+                "FROM peer_routes WHERE peer_id = ?";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, peerId.value());
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? mapPeerRoute(resultSet) : null;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to get peer route for " + peerId, e);
+        }
+    }
+
+    @Override
+    public List<PeerRoute> listPeerRoutes() {
+        List<PeerRoute> results = new ArrayList<>();
+        String sql = "SELECT peer_id, direct_multiaddr, relay_multiaddr, display_name, pre_key_bundle, last_seen " +
+                "FROM peer_routes ORDER BY last_seen DESC";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql);
+             ResultSet resultSet = statement.executeQuery()) {
+            while (resultSet.next()) {
+                results.add(mapPeerRoute(resultSet));
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to list peer routes", e);
+        }
+        return results;
+    }
+
+    private static PeerRoute mapPeerRoute(ResultSet resultSet) throws SQLException {
+        return new PeerRoute(
+                new PeerId(resultSet.getString("peer_id")),
+                resultSet.getString("direct_multiaddr"),
+                resultSet.getString("relay_multiaddr"),
+                resultSet.getString("display_name"),
+                resultSet.getBytes("pre_key_bundle"),
+                resultSet.getLong("last_seen")
         );
     }
 

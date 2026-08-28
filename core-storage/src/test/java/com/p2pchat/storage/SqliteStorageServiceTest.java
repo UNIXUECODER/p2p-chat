@@ -9,6 +9,7 @@ import com.p2pchat.storage.model.DeliveryState;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.Pagination;
+import com.p2pchat.storage.model.PeerRoute;
 import com.p2pchat.storage.model.TransferState;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -198,6 +199,16 @@ class SqliteStorageServiceTest {
         assertThat(stateOf(messages, "m-bob")).isEqualTo(DeliveryState.DELIVERED); // Bob's own — untouched
     }
 
+    private static DeliveryState stateOf(List<Message> messages, String messageId) {
+        return messages.stream()
+                .filter(m -> m.messageId().equals(messageId))
+                .findFirst()
+                .orElseThrow(() -> new AssertionError("expected message " + messageId + " to be present"))
+                .state();
+    }
+
+    // ---- M6g-1: read queries ----
+
     @Test
     void listContactsReturnsAlphabeticalOrderAndHandlesEmptyTable() {
         assertThat(storageService.listContacts()).isEmpty();
@@ -273,11 +284,55 @@ class SqliteStorageServiceTest {
                 .containsExactly("c-recent-activity", "c-old-activity", "c-newer-inactive", "c-inactive");
     }
 
-    private static DeliveryState stateOf(List<Message> messages, String messageId) {
-        return messages.stream()
-                .filter(m -> m.messageId().equals(messageId))
-                .findFirst()
-                .orElseThrow(() -> new AssertionError("expected message " + messageId + " to be present"))
-                .state();
+    // ---- M6g-2: peer_routes ----
+
+    @Test
+    void getPeerRouteReturnsNullBeforeAnyObservation() {
+        assertThat(storageService.getPeerRoute(new PeerId("peer-nobody"))).isNull();
+    }
+
+    @Test
+    void upsertPeerRouteMergesRatherThanOverwritingUnobservedFields() {
+        PeerId alice = new PeerId("peer-alice");
+
+        PeerRoute afterFirst = storageService.upsertPeerRoute(new PeerRoute(
+                alice, "/ip4/10.0.0.1/tcp/9000/p2p/peer-alice", null, null, null, 1000L));
+        assertThat(afterFirst.directMultiaddr()).isEqualTo("/ip4/10.0.0.1/tcp/9000/p2p/peer-alice");
+        assertThat(afterFirst.relayMultiaddr()).isNull();
+
+        // Second observation only learns a relay address + display name -- must NOT erase the
+        // direct multiaddr the first observation already established. This is the entire point
+        // of the merge-upsert: real call sites (discovery, contacts.add, an inbound message's
+        // senderAddress) each learn a different subset of a route at different times.
+        PeerRoute afterSecond = storageService.upsertPeerRoute(new PeerRoute(
+                alice, null, "/ip4/1.2.3.4/tcp/9100/p2p/relay", "Alice", null, 2000L));
+        assertThat(afterSecond.directMultiaddr()).isEqualTo("/ip4/10.0.0.1/tcp/9000/p2p/peer-alice");
+        assertThat(afterSecond.relayMultiaddr()).isEqualTo("/ip4/1.2.3.4/tcp/9100/p2p/relay");
+        assertThat(afterSecond.displayName()).isEqualTo("Alice");
+        assertThat(afterSecond.lastSeen()).isEqualTo(2000L); // always taken from the new observation
+
+        // Third observation supplies a genuinely NEW direct multiaddr -- a non-null field always
+        // wins over whatever was stored before, replacing the now-stale one.
+        byte[] bundle = {1, 2, 3};
+        PeerRoute afterThird = storageService.upsertPeerRoute(new PeerRoute(
+                alice, "/ip4/10.0.0.2/tcp/9000/p2p/peer-alice", null, null, bundle, 3000L));
+        assertThat(afterThird.directMultiaddr()).isEqualTo("/ip4/10.0.0.2/tcp/9000/p2p/peer-alice");
+        assertThat(afterThird.relayMultiaddr()).isEqualTo("/ip4/1.2.3.4/tcp/9100/p2p/relay"); // still preserved
+        assertThat(afterThird.displayName()).isEqualTo("Alice"); // still preserved
+        assertThat(afterThird.preKeyBundle()).isEqualTo(bundle);
+
+        PeerRoute fetched = storageService.getPeerRoute(alice);
+        assertThat(fetched.directMultiaddr()).isEqualTo(afterThird.directMultiaddr());
+        assertThat(fetched.lastSeen()).isEqualTo(3000L);
+    }
+
+    @Test
+    void listPeerRoutesOrdersMostRecentlyObservedFirst() {
+        storageService.upsertPeerRoute(new PeerRoute(new PeerId("peer-old"), "/ip4/10.0.0.1/tcp/9000", null, null, null, 500L));
+        storageService.upsertPeerRoute(new PeerRoute(new PeerId("peer-new"), "/ip4/10.0.0.2/tcp/9000", null, null, null, 1500L));
+
+        List<PeerRoute> routes = storageService.listPeerRoutes();
+        assertThat(routes).extracting(PeerRoute::peerId)
+                .containsExactly(new PeerId("peer-new"), new PeerId("peer-old"));
     }
 }

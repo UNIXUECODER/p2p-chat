@@ -93,11 +93,14 @@
 
 **Decision:** A new `PeerRoutingTable` class in `node-daemon`, not `core-network`.
 
+**Update after implementation (M6g-2):** `PeerRoute` itself ended up in `core-storage.model`, not `node-daemon` — see that record's own Javadoc. `PeerRoutingTable` is still exactly the `node-daemon` class this section describes.
+
 Responsibilities:
-- Maps `PeerId → PeerRoute { directMultiaddr, relayMultiaddr, hasSession, displayName, lastSeen }`.
-- **Populated by:** discovery lookups (M6f), inbound `senderAddress` from chat/file-offer payloads, `contacts.add` flow, relay registrations.
+- Maps `PeerId → PeerRoute { directMultiaddr, relayMultiaddr, displayName, preKeyBundle, lastSeen }`. No `hasSession` field, correcting an inconsistency in an earlier draft of this section — that fact is derived at read time from `SessionManager.hasSession(PeerId)` (i.e. `signalStore.containsSession(...)`), never stored, since a second, unsynchronized copy of it here would go stale the moment a session is established or torn down without this row being told. §3's own `PeerRoute` field list already reflected this; this line didn't, until now.
+- **Populated by:** discovery lookups (M6f), inbound `senderAddress` from chat/file-offer payloads (M6g-3 — not yet wired), `contacts.add` flow (M6g-2), relay registrations.
 - **Consulted by:** `messages.send` / `files.send` (so the RPC caller needs only a `conversationId`, not raw multiaddrs).
 - **Persisted?** Yes, via a new `peer_routes` table (new migration `V004__peer_routes.sql`). A daemon restart shouldn't forget how to reach known peers.
+- **M6g-2 also added:** a merge-upsert, not a blind overwrite — a `null` field on a new observation preserves whatever was already known for that field rather than erasing it, since the different populating sources above each learn a different subset of a route at different times. See `StorageService.upsertPeerRoute`'s own Javadoc.
 
 **Why `node-daemon`, not `core-network`:**
 - `core-network` is the libp2p abstraction layer. It doesn't know about contacts, conversations, or discovery records.
@@ -140,7 +143,7 @@ Responsibilities:
 ]
 ```
 
-Returns entries from `PeerRoutingTable` where `hasSession == true` (i.e., `signalStore.containsSession(...)` for that peer). `lastSeen` is the epoch-millis timestamp of the last message exchanged (sent or received). `displayName` comes from the contact record if one exists, otherwise from the most recent `ChatMessagePayload.senderAddress()` metadata.
+Returns entries from `PeerRoutingTable` where `hasSession == true` (i.e., `signalStore.containsSession(...)` for that peer). `lastSeen` is the epoch-millis timestamp of the last message exchanged (sent or received). `displayName` comes from the contact record if one exists, otherwise from `PeerRoute.displayName()` (e.g. an invite code's cosmetic `n` field) if that's been set — **correction:** an earlier draft of this line said `ChatMessagePayload.senderAddress()` could also supply it; that field is a dialable multiaddr, not a name (see its own Javadoc), and never has been — it's a legitimate source for `PeerRoute.directMultiaddr()`, not `displayName`.
 
 **What this does NOT tell you:**
 - Whether the peer is *currently online* — there's no heartbeat or presence protocol. A peer with `hasSession == true` who turned off their machine an hour ago still appears here. Real presence detection (ping probes, relay-mediated heartbeat) is a future concern, not M6g scope.
@@ -196,6 +199,8 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 
 ### M6g-1 — StorageService read-side expansion
 
+**Status: done ✅** — see README's M6g-1 section for what actually shipped (matches this plan exactly, plus an unrelated HLC clock-drift regression fix bundled in alongside it).
+
 **Goal:** Fill the read-side gaps in `StorageService` that every `*.list` RPC method needs.
 
 **New `StorageService` methods:**
@@ -212,27 +217,30 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 
 ### M6g-2 — Peer routing table + invite code resolution
 
+**Status: done 🔄** — sandbox-verified by 52 real, executed checks (see README's M6g-2 section); pending a real `./gradlew test` confirmation. Implementation differs from this plan in a few places the README section explains — summarized inline below rather than left for the reader to spot as a diff.
+
 **Goal:** Build the peer-resolution layer that `messages.send` and `contacts.add` need.
 
 **New code:**
-- **`PeerRoute`** record (`node-daemon`): `{ PeerId peerId, String directMultiaddr, String relayMultiaddr, String displayName, long lastSeen }`.
-- **`PeerRoutingTable`** class (`node-daemon`): in-memory + persistent map of `PeerId → PeerRoute`. Backed by `V004__peer_routes.sql`.
-- **`V004__peer_routes.sql`** migration (`core-storage`):
+- **`PeerRoute`** record — **ended up in `core-storage.model`, not `node-daemon`** as first sketched here (see that record's own Javadoc for why): `{ PeerId peerId, String directMultiaddr, String relayMultiaddr, String displayName, byte[] preKeyBundle, long lastSeen }`. One field beyond this plan's original list — `preKeyBundle` — added during implementation: the discovery-verified pre-key bundle needs to live *somewhere* between `contacts.add` and a later `messages.send` given the eager-session-establishment decision below, and `PeerRoute` already models exactly this kind of "best current knowledge, subject to being superseded" data.
+- **`PeerRoutingTable`** class (`node-daemon`): a thin façade over `StorageService`'s new peer-route methods — **no in-memory cache**, unlike this plan's original "in-memory + persistent" description (see README section for the reasoning: a cache here would be a second, potentially-stale copy of the same data for a lookup that's already fast enough against SQLite directly).
+- **`V004__peer_routes.sql`** migration (`core-storage`) — one column beyond the sketch below, `pre_key_bundle BLOB`, for the same reason as `PeerRoute`'s extra field:
   ```sql
   CREATE TABLE peer_routes (
       peer_id           TEXT PRIMARY KEY,
       direct_multiaddr  TEXT,
       relay_multiaddr   TEXT,
       display_name      TEXT,
+      pre_key_bundle    BLOB,
       last_seen         INTEGER NOT NULL
   );
   ```
 - **`InviteCodeCodec`** (`node-daemon`): encode/decode the base64url JSON invite code defined in §2.1.
-- **`ContactService`** (`node-daemon`): orchestrates the `contacts.add` flow (§2.1): decode invite code → discovery lookup → verify signed record → extract addresses + bundle → persist contact → populate routing table → optionally establish Signal session.
+- **`ContactService`** (`node-daemon`): orchestrates the `contacts.add` flow (§2.1): decode invite code → discovery lookup → verify signed record → extract addresses + bundle → persist contact → populate routing table. **Does NOT optionally establish a Signal session**, unlike this plan's original last step — see README's M6g-2 section for why: it would spend a one-time prekey on every contact added, whether or not they're ever messaged, compounding the exact unmanaged-prekey-resource problem M6e-2's testing already found. `SessionManager.sendChatMessage`'s existing lazy `bundleIfNoSessionYet` mechanism is reused for this instead, at actual send time.
 
 **Scope note:** `ContactService` calls `DiscoveryController.lookup(...)`, which requires a live connection to a discovery server. For testability, the discovery lookup is injected as a functional interface (same pattern `SessionManager` uses with `FileTransferHandler`), not hardcoded.
 
-**Verification:** Unit tests for `InviteCodeCodec` (round-trip, missing fields, malformed input). Unit tests for `PeerRoutingTable` (CRUD, persistence across simulated restart). Integration-style test for `ContactService` with a fake discovery lookup returning a pre-built signed record.
+**Verification:** Unit tests for `InviteCodeCodec` (round-trip, missing fields, malformed input). Unit tests for `PeerRoutingTable` (CRUD, persistence across simulated restart). Integration-style test for `ContactService` with a fake discovery lookup returning a pre-built signed record — extended, during implementation, to also cover a record signed by the *wrong* key, since a codec with its own passing tests doesn't by itself prove the caller who's supposed to reject a mismatch actually does.
 
 ---
 
