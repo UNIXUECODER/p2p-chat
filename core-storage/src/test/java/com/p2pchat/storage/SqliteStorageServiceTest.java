@@ -83,6 +83,28 @@ class SqliteStorageServiceTest {
     }
 
     @Test
+    void updateTransferStateChangesAnExistingTransferStateAndUnknownIsANoOp() throws SQLException {
+        FileTransfer transfer = new FileTransfer(
+                "t1", "c1", "file.txt", 1024L, "hash123", 256 * 1024, 4,
+                TransferState.OFFERED, "/tmp/file.txt", System.currentTimeMillis()
+        );
+        storageService.saveFileMetadata(transfer);
+
+        storageService.updateTransferState("t1", TransferState.IN_PROGRESS);
+
+        try (var statement = database.connection().prepareStatement("SELECT state FROM file_transfers WHERE transfer_id = ?")) {
+            statement.setString(1, "t1");
+            try (var resultSet = statement.executeQuery()) {
+                assertThat(resultSet.next()).isTrue();
+                assertThat(resultSet.getString("state")).isEqualTo("IN_PROGRESS");
+            }
+        }
+
+        // Unknown transferId is a no-op, must not throw
+        storageService.updateTransferState("no-such-transfer", TransferState.COMPLETED);
+    }
+
+    @Test
     void transactionRollbackOnException() {
         storageService.saveConversation(new Conversation("c1", ConversationType.DIRECT, "Bob", 1000));
 

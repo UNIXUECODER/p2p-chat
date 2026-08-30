@@ -7,9 +7,13 @@ import com.p2pchat.crypto.SecureSessionService;
 import com.p2pchat.daemon.dispatch.ApplicationMessageRouter;
 import com.p2pchat.daemon.dispatch.DispatchedMessage;
 import com.p2pchat.daemon.send.OutboundMessageService;
+import com.p2pchat.filetransfer.FileChunker;
+import com.p2pchat.filetransfer.FileKey;
 import com.p2pchat.filetransfer.wire.FileChunkPayload;
 import com.p2pchat.filetransfer.wire.FileChunkRequestPayload;
 import com.p2pchat.filetransfer.wire.FileOfferPayload;
+import com.p2pchat.filetransfer.wire.FileTransferMessage;
+import com.p2pchat.filetransfer.wire.FileTransferMessageCodec;
 import com.p2pchat.messaging.HlcTimestamp;
 import com.p2pchat.messaging.HybridLogicalClock;
 import com.p2pchat.messaging.wire.ChatMessageCodec;
@@ -34,6 +38,8 @@ import org.signal.libsignal.protocol.state.PreKeyBundle;
 import org.signal.libsignal.protocol.state.SignalProtocolStore;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
@@ -63,16 +69,25 @@ import java.util.concurrent.Executors;
  *   RelayEventHandler} — nothing through M5e or M6b ever proved receiving a relay-forwarded
  *   message either, so this would be genuinely new networking capability, not just wiring
  *   already-proven pieces together. Named here so it's a tracked gap, not a silent one.</li>
- *   <li><b>Explicitly deferred, not silently skipped:</b> the full resumable file-transfer
- *   chunk state machine {@code FileReceiverMain}/{@code FileSenderMain} (M4c/M4d) already
- *   proved. File-transfer messages are correctly routed here — proving M6a's dispatcher earns
- *   its keep for both message families, not just chat — but handling is delegated to a
- *   pluggable {@link FileTransferHandler}, not reimplemented inline.</li>
+ *   <li><b>M6g-3 update:</b> the file-transfer chunk state machine {@code
+ *   FileReceiverMain}/{@code FileSenderMain} (M4c/M4d) proved is no longer deferred — {@link
+ *   DefaultFileTransferHandler} is a real {@link FileTransferHandler} implementation, and
+ *   {@link #sendFile}/{@link #acceptFileTransfer} are real methods on this class now, not a
+ *   named future gap. See that class's own Javadoc for what changed versus the demos' proven
+ *   logic, and why.</li>
  *   <li><b>Explicitly deferred, not silently skipped:</b> pre-key bundle lifecycle/replenishment
  *   policy. Already named as undecided when M6 was first scoped ("the persistence mechanism now
  *   exists — M6e-1 — but the generation policy is still undecided"); still true, still not this
  *   milestone's job, which is wiring the store into a daemon core, not managing its contents.</li>
  * </ul>
+ *
+ * <p><b>M6g-3: {@link DaemonEventListener} calls run on their own {@code eventExecutor}, never on
+ * {@code inboundExecutor}.</b> {@code inboundExecutor} being single-threaded exists for one
+ * narrow, load-bearing reason — see that field's own comment below — and a slow or stuck listener
+ * implementation (a real one will eventually do WebSocket I/O to a possibly-slow client) has
+ * nothing to do with what that thread actually protects. Decided at the same time this
+ * interface's shape was designed, not discovered as a problem afterward — see {@link
+ * DaemonEventListener}'s own Javadoc for the full reasoning.</p>
  *
  * <p><b>Canonical identity, applied correctly this time.</b> Every {@link SignalProtocolAddress}
  * here is built from the {@link PeerId} {@code OnEnvelopeMessage} itself delivers — confirmed,
@@ -128,9 +143,11 @@ public final class SessionManager implements AutoCloseable {
     private final StorageService storage;
     private final SignalProtocolStore signalStore;
     private final FileTransferHandler fileTransferHandler;
+    private final DaemonEventListener listener;
     private final ConnectionStrategy connectionStrategy;
     private final OutboundMessageService outbound;
     private final ExecutorService inboundExecutor;
+    private final ExecutorService eventExecutor;
 
     // Set once, at the end of start() -- see class Javadoc for why these can't be constructed
     // any earlier: the local libp2p peer id (and therefore the local SignalProtocolAddress and
@@ -142,13 +159,20 @@ public final class SessionManager implements AutoCloseable {
 
     public SessionManager(PeerNetworkService network, StorageService storage, SignalProtocolStore signalStore,
                            FileTransferHandler fileTransferHandler) {
+        this(network, storage, signalStore, fileTransferHandler, DaemonEventListener.NONE);
+    }
+
+    public SessionManager(PeerNetworkService network, StorageService storage, SignalProtocolStore signalStore,
+                           FileTransferHandler fileTransferHandler, DaemonEventListener listener) {
         this.network = network;
         this.storage = storage;
         this.signalStore = signalStore;
         this.fileTransferHandler = fileTransferHandler;
+        this.listener = listener;
         this.connectionStrategy = new ConnectionStrategy(network, 5_000);
         this.outbound = new OutboundMessageService(connectionStrategy, Duration.ofSeconds(15));
         this.inboundExecutor = Executors.newSingleThreadExecutor();
+        this.eventExecutor = Executors.newSingleThreadExecutor();
     }
 
     /**
@@ -165,6 +189,12 @@ public final class SessionManager implements AutoCloseable {
         this.ownPeerId = PeerId.of(ownPeerIdValue);
         this.clock = new HybridLogicalClock(ownPeerIdValue);
         this.sessions = new LibsignalSecureSessionService(signalStore, new SignalProtocolAddress(ownPeerIdValue, 1));
+
+        // See FileTransferHandler.EncryptAndSend's own Javadoc for why this is a functional
+        // interface rather than handing DefaultFileTransferHandler `sessions`/`outbound`
+        // directly. This lambda is the one place those two concrete, libsignal/jvm-libp2p-typed
+        // collaborators actually meet the file-transfer handler's narrower, decoupled seam.
+        fileTransferHandler.attach(this::encryptAndSendFileTransferMessage, ownPeerId, ownAddress);
     }
 
     public PeerId localPeerId() {
@@ -198,6 +228,10 @@ public final class SessionManager implements AutoCloseable {
         try {
             if (bundleIfNoSessionYet != null && !signalStore.containsSession(remote)) {
                 sessions.establishSession(remote, bundleIfNoSessionYet);
+                // A session that didn't exist a moment ago now does -- see DaemonEventListener's
+                // own Javadoc for why this fires bare, with no payload, rather than trying to
+                // build the full network.status shape here.
+                emit(listener::onNetworkStatusChanged);
             }
             HlcTimestamp timestamp = clock.now();
             byte[] content = text.getBytes(StandardCharsets.UTF_8);
@@ -231,12 +265,88 @@ public final class SessionManager implements AutoCloseable {
         }
     }
 
+    /**
+     * Offers {@code filePath} to {@code targetPeerId} — M6g-3's new public entry point for
+     * initiating a file transfer, mirroring {@link #sendChatMessage}'s own shape deliberately:
+     * explicit {@code directMultiaddr}/{@code relayMultiaddr} parameters, not a {@code
+     * PeerRoutingTable} dependency this class doesn't otherwise have. The M6g-3 plan's original
+     * sketch described {@code sendFile} as resolving addresses via {@code PeerRoutingTable}
+     * directly, but building that in would have made this the only method on this class that
+     * resolves its own addresses instead of receiving them — an inconsistency with an established,
+     * already-proven method's own signature that a caller (the eventual M6g-4 JSON-RPC layer)
+     * can trivially avoid just by calling {@code PeerRoutingTable.get(...)} itself before calling
+     * this, the same way it will already need to for {@code sendChatMessage}.
+     *
+     * <p>Does not itself persist a {@code file_transfers} row for the sending side — the current
+     * schema has no column distinguishing a sent transfer from a received one (no {@code
+     * sender_peer_id}/{@code direction} field exists), so a row written here would be
+     * indistinguishable from one written by {@link DefaultFileTransferHandler#onFileOffer} for an
+     * inbound offer. Adding that distinction is real schema-design work this method doesn't
+     * casually decide as a side effect — named here as a genuine, deliberately out-of-scope gap,
+     * not a silent omission, matching this project's established practice for exactly this shape
+     * of decision.
+     *
+     * @return a future that always resolves to a {@link ConnectivityStatus}, matching {@link
+     *         #sendChatMessage}'s own guarantee — never completes exceptionally.
+     */
+    public CompletableFuture<ConnectivityStatus> sendFile(PeerId targetPeerId, String directMultiaddr,
+                                                            String relayMultiaddr, Path filePath) {
+        requireStarted();
+        try {
+            if (!Files.isRegularFile(filePath)) {
+                return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+            }
+            int chunkSize = FileChunker.DEFAULT_CHUNK_SIZE_BYTES;
+            long fileSize = Files.size(filePath);
+            int totalChunks = FileChunker.chunkCount(fileSize, chunkSize);
+            String fileHash = FileChunker.sha256HexOfFile(filePath);
+            FileKey fileKey = FileKey.generate();
+            String transferId = UUID.randomUUID().toString();
+
+            fileTransferHandler.registerOutgoingTransfer(
+                    transferId, filePath, fileKey, chunkSize, targetPeerId, directMultiaddr, relayMultiaddr);
+
+            FileOfferPayload offer = new FileOfferPayload(transferId, ownAddress, filePath.getFileName().toString(),
+                    fileSize, fileHash, chunkSize, totalChunks, fileKey.bytes());
+
+            SignalProtocolAddress remote = new SignalProtocolAddress(targetPeerId.value(), 1);
+            EncryptedFrame frame = sessions.encrypt(remote, FileTransferMessageCodec.encode(offer));
+            byte[] wire = EncryptedFrameCodec.encode(frame);
+
+            return outbound.send(directMultiaddr, relayMultiaddr, targetPeerId.value(), wire);
+        } catch (Exception e) {
+            // Same principle as sendChatMessage: a failure this early still resolves to a
+            // definitive status rather than throwing out of this method.
+            return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+        }
+    }
+
+    /**
+     * Accepts a previously-offered, still-pending file transfer, saving it to {@code savePath}
+     * once complete. Pure delegation to {@link #fileTransferHandler} — all the real state (which
+     * offers are pending, what their file key and sender address are) lives there, not here, the
+     * same way {@link #handleFileTransferMessage} already delegates every inbound file-transfer
+     * message without holding any transfer state itself.
+     */
+    public void acceptFileTransfer(String transferId, Path savePath) {
+        requireStarted();
+        fileTransferHandler.acceptFileTransfer(transferId, savePath);
+    }
+
     private void handleInboundEnvelope(PeerId sender, byte[] wireData) {
         inboundExecutor.submit(() -> {
             try {
                 EncryptedFrame frame = EncryptedFrameCodec.decode(wireData);
                 SignalProtocolAddress remote = new SignalProtocolAddress(sender.value(), 1);
+                // Read-only, so safe to check before the decrypt it's reasoning about -- PQXDH
+                // session establishment for a peer's first PreKey message happens transparently
+                // INSIDE decrypt() (see class Javadoc), invisible to this caller unless it
+                // compares before/after itself. This is that comparison.
+                boolean hadSessionBefore = signalStore.containsSession(remote);
                 byte[] plaintext = sessions.decrypt(remote, frame);
+                if (!hadSessionBefore) {
+                    emit(listener::onNetworkStatusChanged);
+                }
                 handleDecryptedPlaintext(sender, plaintext);
             } catch (Exception e) {
                 // One peer's malformed/corrupted frame must not take the daemon down, and must
@@ -266,8 +376,10 @@ public final class SessionManager implements AutoCloseable {
     private void handleChatMessage(PeerId sender, ChatWireMessage message) {
         switch (message) {
             case ChatMessagePayload chat -> handleChatMessagePayload(sender, chat);
-            case DeliveryReceiptPayload receipt ->
-                    storage.updateDeliveryState(receipt.messageId(), DeliveryState.DELIVERED);
+            case DeliveryReceiptPayload receipt -> {
+                storage.updateDeliveryState(receipt.messageId(), DeliveryState.DELIVERED);
+                emit(() -> listener.onDeliveryStateChanged(receipt.messageId(), DeliveryState.DELIVERED));
+            }
             case ReadReceiptPayload read -> storage.markMessagesReadUpTo(
                     read.conversationId(), ownPeerId, read.readUpToHlcTimestamp().toString());
         }
@@ -313,15 +425,20 @@ public final class SessionManager implements AutoCloseable {
             // list, resolved here: the whole upsert-conversation + save-message sequence commits
             // or rolls back as one unit, not two independent writes a crash between them could
             // leave half-applied.
-            storage.runInTransaction(() -> {
+            Message received = storage.runInTransaction(() -> {
                 storage.saveConversation(new Conversation(
                         conversationId, ConversationType.DIRECT, sender.value(), System.currentTimeMillis()));
-                storage.saveMessage(new Message(
+                Message message = new Message(
                         chat.messageId(), conversationId, sender, DeviceId.DEFAULT,
                         chat.hlcTimestamp().toString(), // the ORIGINAL author's timestamp, not clock.update()'s return value
-                        chat.contentType(), chat.content(), DeliveryState.DELIVERED, System.currentTimeMillis()));
-                return null;
+                        chat.contentType(), chat.content(), DeliveryState.DELIVERED, System.currentTimeMillis());
+                storage.saveMessage(message);
+                return message;
             });
+            // Only for a genuine new message, never a re-acked duplicate -- see
+            // DaemonEventListener.onMessageReceived's own Javadoc: "never before" persistence,
+            // and never for something the caller should already know about from the first time.
+            emit(() -> listener.onMessageReceived(received));
         }
 
         // Delivery receipt, always -- for a genuine new message and for a re-acked duplicate
@@ -380,15 +497,57 @@ public final class SessionManager implements AutoCloseable {
         return multiaddr.substring(index + "/p2p/".length());
     }
 
+    // M6g-3 update, then reverted: initially made package-private so DefaultFileTransferHandler
+    // (same package) could reuse this exact derivation. Reverted back to private after actually
+    // attempting to verify DefaultFileTransferHandler in isolation (see that class's own
+    // "duplicated, not shared" note on its own copy of this logic for the full reasoning) --
+    // sharing it would have meant DefaultFileTransferHandler.java could never compile without
+    // this whole file (which needs libsignal-client/jvm-libp2p) also compiling, quietly
+    // destroying the real, executed verification this milestone's chunk state machine could
+    // otherwise get. A concrete cost discovered by trying, not weighed accurately in advance.
     private static String deriveDirectConversationId(String peerIdA, String peerIdB) {
         return peerIdA.compareTo(peerIdB) <= 0
                 ? "direct-" + peerIdA + "-" + peerIdB
                 : "direct-" + peerIdB + "-" + peerIdA;
     }
 
+    /**
+     * How {@link #fileTransferHandler} actually sends a reply — the concrete implementation of
+     * {@link FileTransferHandler.EncryptAndSend} passed to {@code attach(...)} in {@link #start},
+     * built here because this is the one place {@code sessions} and {@code outbound} (both
+     * libsignal/jvm-libp2p-typed) and the file-transfer handler's decoupled seam actually meet.
+     */
+    private CompletableFuture<ConnectivityStatus> encryptAndSendFileTransferMessage(
+            PeerId targetPeerId, String directMultiaddr, String relayMultiaddr, FileTransferMessage message) {
+        try {
+            SignalProtocolAddress remote = new SignalProtocolAddress(targetPeerId.value(), 1);
+            EncryptedFrame frame = sessions.encrypt(remote, FileTransferMessageCodec.encode(message));
+            return outbound.send(directMultiaddr, relayMultiaddr, targetPeerId.value(), EncryptedFrameCodec.encode(frame));
+        } catch (Exception e) {
+            return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+        }
+    }
+
+    /**
+     * Dispatches a {@link DaemonEventListener} call onto {@link #eventExecutor}, never the
+     * caller's own thread — see class Javadoc for why. Fire-and-forget deliberately: a listener
+     * call failing or running slowly is the listener's problem, not something that should ever
+     * affect message processing's own success/failure.
+     */
+    private void emit(Runnable listenerCall) {
+        eventExecutor.submit(() -> {
+            try {
+                listenerCall.run();
+            } catch (Exception e) {
+                System.err.println("[session-manager] DaemonEventListener threw: " + e);
+            }
+        });
+    }
+
     @Override
     public void close() {
         inboundExecutor.shutdown();
+        eventExecutor.shutdown();
         outbound.close();
         try {
             network.stop();

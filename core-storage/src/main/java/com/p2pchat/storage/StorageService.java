@@ -8,6 +8,7 @@ import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.Pagination;
 import com.p2pchat.storage.model.PeerRoute;
+import com.p2pchat.storage.model.TransferState;
 
 import java.util.List;
 import java.util.function.Supplier;
@@ -73,6 +74,21 @@ public interface StorageService {
      * {@link #markChunkReceived} can be called.
      */
     void saveFileMetadata(FileTransfer transfer);
+
+    /**
+     * M6g-3: transitions a transfer's {@code state} (OFFERED → ACCEPTED → IN_PROGRESS →
+     * COMPLETED/FAILED, per {@code TransferState}). A genuinely separate method from {@link
+     * #saveFileMetadata} on purpose, not an oversight of that method's own contract — {@code
+     * saveFileMetadata} is deliberately {@code INSERT OR IGNORE} (see its own Javadoc: "existing
+     * rows are left untouched"), which makes it structurally incapable of ever changing a stored
+     * row's state once the row exists, no matter what {@code TransferState} value the caller
+     * passes in on a later call. This method exists for exactly the update that one can't do —
+     * same "narrow, targeted method matching a real caller's need" convention as {@link
+     * #updateDeliveryState}, which this mirrors field-for-field on the sibling {@code messages}
+     * table. A no-op, not an error, if {@code transferId} doesn't exist — matching {@code
+     * updateDeliveryState}'s own established behavior for an unknown id.
+     */
+    void updateTransferState(String transferId, TransferState newState);
 
     /**
      * Inserts a conversation. Safe to call more than once for the same {@code conversationId}

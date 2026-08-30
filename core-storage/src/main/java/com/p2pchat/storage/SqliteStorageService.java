@@ -125,6 +125,15 @@ public final class SqliteStorageService implements StorageService {
     }
 
     @Override
+    public void updateTransferState(String transferId, TransferState newState) {
+        String sql = "UPDATE file_transfers SET state = ? WHERE transfer_id = ?";
+        runUpdate(sql, statement -> {
+            statement.setString(1, newState.name());
+            statement.setString(2, transferId);
+        });
+    }
+
+    @Override
     public void saveConversation(Conversation conversation) {
         // INSERT OR IGNORE, same reasoning as saveFileMetadata: messages has a foreign key on
         // conversations(conversation_id) (see V001__init.sql), so saveMessage requires this row

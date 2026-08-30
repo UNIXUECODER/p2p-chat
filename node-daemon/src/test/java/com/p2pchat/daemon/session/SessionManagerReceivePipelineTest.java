@@ -9,6 +9,8 @@ import com.p2pchat.messaging.wire.ReadReceiptPayload;
 import com.p2pchat.model.PeerId;
 import com.p2pchat.storage.SqliteDatabase;
 import com.p2pchat.storage.SqliteStorageService;
+import com.p2pchat.storage.model.DeliveryState;
+import com.p2pchat.storage.model.Message;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -19,6 +21,8 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.Statement;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -149,6 +153,114 @@ class SessionManagerReceivePipelineTest {
         assertThat(deliveryStateOf("a1a1a1a1-0000-4000-8000-000000000004")).isEqualTo("READ");
     }
 
+    // ---- M6g-3: DaemonEventListener wiring. A separate, locally-constructed SessionManager per
+    // test below (not the shared `sessionManager` field, which uses the 4-arg constructor and
+    // DaemonEventListener.NONE) -- keeps the existing five tests above completely undisturbed
+    // while proving the new listener wiring against its own isolated instance.
+    //
+    // DaemonEventListener calls run on their own eventExecutor (see SessionManager's own class
+    // Javadoc for why), so assertions below poll briefly rather than assuming synchronous
+    // delivery -- same reasoning as awaitSentCount already established for the auto-delivery-
+    // receipt path.
+    //
+    // Not covered here: onNetworkStatusChanged. Its two real trigger points (handleInboundEnvelope's
+    // pre/post-decrypt session check, and sendChatMessage's establishSession call) both require
+    // capabilities FakeSecureSessionServiceForTest deliberately doesn't provide -- decrypt() and
+    // establishSession() both throw UnsupportedOperationException by design (see that class's own
+    // Javadoc: "Not testing encryption correctness here at all"), and handleDecryptedPlaintext
+    // (this test class's one seam) is called after decrypt would already have happened, bypassing
+    // the exact check that fires this event. Extending the fake to support it would risk the
+    // "only encrypt needs to actually work" contract every other test in this file already
+    // depends on -- a real, honestly-named gap rather than a forced, low-value test.
+
+    @Test
+    void aNewChatMessageFiresOnMessageReceivedWithTheExactPersistedMessage() throws Exception {
+        List<Message> received = new CopyOnWriteArrayList<>();
+        DaemonEventListener capturingListener = new DaemonEventListener() {
+            @Override
+            public void onMessageReceived(Message message) {
+                received.add(message);
+            }
+        };
+        SessionManager sm = new SessionManager(fakeNetwork, storage, null, new FileTransferHandler() {
+        }, capturingListener);
+        sm.initializeForTesting(ownPeerId, "/ip4/127.0.0.1/tcp/9200/p2p/" + ownPeerId.value(),
+                new HybridLogicalClock(ownPeerId.value()), fakeSessions);
+        try {
+            ChatMessagePayload chat = new ChatMessagePayload(
+                    "a1a1a1a1-0000-4000-8000-000000000006", senderAddress,
+                    new HlcTimestamp(1000L, 0, senderPeerId.value()), "direct-a-b", "text/plain",
+                    "event test".getBytes(StandardCharsets.UTF_8), null);
+
+            sm.handleDecryptedPlaintext(senderPeerId, ChatMessageCodec.encode(chat));
+
+            awaitSize(received, 1);
+            assertThat(received).hasSize(1);
+            assertThat(received.get(0).messageId()).isEqualTo(chat.messageId());
+            assertThat(received.get(0).plaintext()).isEqualTo("event test".getBytes(StandardCharsets.UTF_8));
+        } finally {
+            sm.close();
+        }
+    }
+
+    @Test
+    void aDuplicateMessageDoesNotFireOnMessageReceivedASecondTime() throws Exception {
+        List<Message> received = new CopyOnWriteArrayList<>();
+        DaemonEventListener capturingListener = new DaemonEventListener() {
+            @Override
+            public void onMessageReceived(Message message) {
+                received.add(message);
+            }
+        };
+        SessionManager sm = new SessionManager(fakeNetwork, storage, null, new FileTransferHandler() {
+        }, capturingListener);
+        sm.initializeForTesting(ownPeerId, "/ip4/127.0.0.1/tcp/9200/p2p/" + ownPeerId.value(),
+                new HybridLogicalClock(ownPeerId.value()), fakeSessions);
+        try {
+            ChatMessagePayload chat = new ChatMessagePayload(
+                    "a1a1a1a1-0000-4000-8000-000000000007", senderAddress,
+                    new HlcTimestamp(1000L, 0, senderPeerId.value()), "direct-a-b", "text/plain",
+                    "sent twice".getBytes(StandardCharsets.UTF_8), null);
+            byte[] wire = ChatMessageCodec.encode(chat);
+
+            sm.handleDecryptedPlaintext(senderPeerId, wire);
+            sm.handleDecryptedPlaintext(senderPeerId, wire); // the sender's earlier ack was "lost"
+
+            awaitSize(received, 1);
+            Thread.sleep(200); // grace period -- proving a second event does NOT eventually arrive, not just that it hasn't yet
+            assertThat(received).hasSize(1);
+        } finally {
+            sm.close();
+        }
+    }
+
+    @Test
+    void aDeliveryReceiptFiresOnDeliveryStateChanged() throws Exception {
+        List<DeliveryState> received = new CopyOnWriteArrayList<>();
+        DaemonEventListener capturingListener = new DaemonEventListener() {
+            @Override
+            public void onDeliveryStateChanged(String messageId, DeliveryState newState) {
+                received.add(newState);
+            }
+        };
+        SessionManager sm = new SessionManager(fakeNetwork, storage, null, new FileTransferHandler() {
+        }, capturingListener);
+        sm.initializeForTesting(ownPeerId, "/ip4/127.0.0.1/tcp/9200/p2p/" + ownPeerId.value(),
+                new HybridLogicalClock(ownPeerId.value()), fakeSessions);
+        try {
+            insertRawSentMessage("a1a1a1a1-0000-4000-8000-000000000008", "SENDING");
+            DeliveryReceiptPayload receipt = new DeliveryReceiptPayload("direct-a-b",
+                    "a1a1a1a1-0000-4000-8000-000000000008");
+
+            sm.handleDecryptedPlaintext(senderPeerId, ChatMessageCodec.encode(receipt));
+
+            awaitSize(received, 1);
+            assertThat(received).containsExactly(DeliveryState.DELIVERED);
+        } finally {
+            sm.close();
+        }
+    }
+
     // ---------------------------------------------------------------- raw SQL verification helpers
 
     private String plaintextCacheOf(String messageId) throws Exception {
@@ -195,6 +307,13 @@ class SessionManagerReceivePipelineTest {
     private void awaitSentCount(int expectedCount) throws Exception {
         long deadline = System.currentTimeMillis() + 3000;
         while (fakeNetwork.sentTo().size() < expectedCount && System.currentTimeMillis() < deadline) {
+            Thread.sleep(10);
+        }
+    }
+
+    private void awaitSize(List<?> list, int expectedSize) throws Exception {
+        long deadline = System.currentTimeMillis() + 3000;
+        while (list.size() < expectedSize && System.currentTimeMillis() < deadline) {
             Thread.sleep(10);
         }
     }

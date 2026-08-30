@@ -246,6 +246,8 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 
 ### M6g-3 — SessionManager event emission + FileTransferHandler implementation
 
+**Status: done ✅** — `DefaultFileTransferHandler`/`FileTransferHandler`/`DaemonEventListener` confirmed by 18 real, executed checks against a genuine two-instance harness (see README's M6g-3 section); `SessionManager`'s own wiring is hand-traced, same limitation as every other change to that file. Implementation differs from this plan in a few places, each explained in full in the README section rather than restated here: `sendFile` takes explicit `directMultiaddr`/`relayMultiaddr` parameters rather than resolving via `PeerRoutingTable` internally (keeps `SessionManager`'s two send methods consistent with each other — neither depends on `PeerRoutingTable`), `onNetworkStatusChanged()` fires with no payload rather than a constructed status object (the same "don't give `SessionManager` a `PeerRoutingTable` dependency it doesn't otherwise need" reasoning M6g-2 already established), and the conversation-ID derivation ended up duplicated in `DefaultFileTransferHandler` rather than shared with `SessionManager` — tried sharing first, reverted after discovering it would have made the whole class uncompilable without `libsignal-client`/`jvm-libp2p`, quietly costing this milestone real verification of its most substantial piece.
+
 **Goal:** Give `SessionManager` a way to notify the WebSocket/JSON-RPC layer when things happen, and wire in the file-transfer lifecycle.
 
 **Changes to `SessionManager`:**
