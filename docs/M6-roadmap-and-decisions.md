@@ -131,24 +131,24 @@ flowchart TD
 
 #### **M6g — JSON-RPC Method Surface, Push Events & Error Vocabulary (revised)**
 
-> **Revised post-M6f:** A gap analysis (`docs/M6g-gap-analysis-and-plan.md`) revealed that M6g's original scope assumed backend capabilities that don't exist yet. M6g is now split into four sub-milestones following the M6e-1/M6e-2 precedent.
+> **Revised post-M6f:** A gap analysis (`docs/M6g-gap-analysis-and-plan.md`) revealed that M6g's original scope assumed backend capabilities that don't exist yet. M6g is split into four sub-milestones following the M6e-1/M6e-2 precedent.
 
-##### M6g-1 — StorageService Read-Side Expansion
+##### M6g-1 — StorageService Read-Side Expansion ✅ (Verified)
 * **Goal**: Fill the read-side gaps in `StorageService` that every `*.list` RPC method needs.
 * **New methods**: `listConversations()`, `listContacts()`, `getConversation(String)`, `getContact(PeerId)`.
-* **Scope**: Pure SQL reads against existing tables. No schema changes. No new dependencies.
-* **Verification**: Unit tests in `SqliteStorageServiceTest` against real in-memory SQLite.
+* **Scope**: Pure SQL reads against existing tables. Bundled with HLC clock-drift regression fix.
+* **Verification**: Unit tests in `SqliteStorageServiceTest` against real in-memory SQLite (14/14).
 
-##### M6g-2 — Peer Routing Table + Invite Code Resolution
+##### M6g-2 — Peer Routing Table + Invite Code Resolution ✅ (Verified)
 * **Goal**: Build the peer-resolution layer that `messages.send` and `contacts.add` need.
-* **New code**: `PeerRoute` record, `PeerRoutingTable` (in-memory + persistent), `V004__peer_routes.sql` migration, `InviteCodeCodec` (base64url JSON: peer ID + optional discovery addr + optional display name), `ContactService` (orchestrates `contacts.add`: decode → discovery lookup → verify signed record → save contact → populate routing table).
-* **Verification**: Unit tests for `InviteCodeCodec`, `PeerRoutingTable`, and `ContactService` with fake discovery.
+* **New code**: `PeerRoute` record (in `core-storage.model`), `PeerRoutingTable`, `V004__peer_routes.sql` migration, `InviteCodeCodec` (base64url JSON: peer ID + optional discovery addr + optional display name), `ContactService` (orchestrates `contacts.add`: decode → discovery lookup → verify signed record → save contact → populate routing table).
+* **Verification**: Unit tests for `InviteCodeCodec` (7/7), `PeerRoutingTable` (4/4, including restart survival across database reopen), and `ContactService` (8/8).
 
-##### M6g-3 — SessionManager Event Emission + FileTransferHandler Implementation
-* **Goal**: Give `SessionManager` a way to notify the WebSocket/JSON-RPC layer, and wire in file-transfer lifecycle.
-* **New code**: `DaemonEventListener` interface (`onMessageReceived`, `onDeliveryStateChanged`, `onFileOfferReceived`, `onFileTransferProgress`, `onNetworkStatusChanged`). `SessionManager` gains event emission call sites, `sendFile(PeerId, Path)`, and `acceptFileTransfer(transferId, savePath)`. `DefaultFileTransferHandler` consolidates `FileSenderMain`/`FileReceiverMain`'s proven chunk logic.
-* **Scope note**: Largest sub-milestone. Porting proven logic, not inventing new mechanics. `files.cancel` deferred to M7.
-* **Verification**: Unit tests for event emission and `DefaultFileTransferHandler` chunk logic against real SQLite + `FileChunker`/`ChunkCipher`.
+##### M6g-3 — SessionManager Event Emission + FileTransferHandler Implementation ✅ (Verified)
+* **Goal**: Give `SessionManager` a way to notify the WebSocket/JSON-RPC layer, and wire in the file-transfer lifecycle.
+* **New code**: `DaemonEventListener` interface (`onMessageReceived`, `onDeliveryStateChanged`, `onFileOfferReceived`, `onFileTransferProgress`, `onNetworkStatusChanged`). `SessionManager` gains event emission call sites, `sendFile(PeerId, Path, String direct, String relay)`, and `acceptFileTransfer(transferId, savePath)`. `DefaultFileTransferHandler` consolidates `FileSenderMain`/`FileReceiverMain`'s proven chunk logic with an accept gate, thread synchronization, and `outgoingTransfers` TTL eviction (24h). Complete lifecycle state handling in `onFileOffer` (`COMPLETED` deduplication, `FAILED` retry via atomic `resetChunkState` in `StorageService`, and partial crash resumption).
+* **Scope note**: `files.cancel` deferred to M7.
+* **Verification**: 9/9 `DefaultFileTransferHandlerTest` scenarios, 9/9 `SessionManagerReceivePipelineTest` cases, and 18/18 `SqliteStorageServiceTest` cases (39/39 tasks green repository-wide).
 
 ##### M6g-4 — JSON-RPC Router, Method Dispatch, Push Events, Error Vocabulary
 * **Goal**: The original M6g scope — now buildable because M6g-1 through M6g-3 provided everything it needs.

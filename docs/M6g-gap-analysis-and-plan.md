@@ -246,7 +246,14 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 
 ### M6g-3 — SessionManager event emission + FileTransferHandler implementation
 
-**Status: done ✅** — `DefaultFileTransferHandler`/`FileTransferHandler`/`DaemonEventListener` confirmed by 18 real, executed checks against a genuine two-instance harness (see README's M6g-3 section); `SessionManager`'s own wiring is hand-traced, same limitation as every other change to that file. Implementation differs from this plan in a few places, each explained in full in the README section rather than restated here: `sendFile` takes explicit `directMultiaddr`/`relayMultiaddr` parameters rather than resolving via `PeerRoutingTable` internally (keeps `SessionManager`'s two send methods consistent with each other — neither depends on `PeerRoutingTable`), `onNetworkStatusChanged()` fires with no payload rather than a constructed status object (the same "don't give `SessionManager` a `PeerRoutingTable` dependency it doesn't otherwise need" reasoning M6g-2 already established), and the conversation-ID derivation ended up duplicated in `DefaultFileTransferHandler` rather than shared with `SessionManager` — tried sharing first, reverted after discovering it would have made the whole class uncompilable without `libsignal-client`/`jvm-libp2p`, quietly costing this milestone real verification of its most substantial piece.
+**Status: done ✅** — fully verified by real, executed `./gradlew test --rerun-tasks` (39/39 tasks green repository-wide). Implementation details and post-audit hardening:
+- `DefaultFileTransferHandler` consolidates M4a–M4d chunk logic into a long-running, multi-session handler with thread-synchronized output paths and an accept gate.
+- Complete lifecycle state differentiation in `onFileOffer`:
+  - `COMPLETED`: quietly ignored on re-offer (no UI spam, zero disk I/O).
+  - `IN_PROGRESS` / `ACCEPTED`: supports partial transfer resumption (e.g. across restart, requesting only genuinely missing chunks).
+  - `FAILED`: recovers from whole-file hash mismatch via atomic `resetChunkState` in `StorageService` (`DELETE FROM file_chunk_state` + `UPDATE file_transfers SET state = 'OFFERED'`), allowing clean retries.
+- `outgoingTransfers` TTL eviction: sender-side transfers expire after 24 hours of inactivity (refreshed per chunk served).
+- `SessionManager` wiring: `DaemonEventListener` dispatched on dedicated single-thread `eventExecutor`; `sendFile`/`acceptFileTransfer` verified via unit tests in `SessionManagerReceivePipelineTest`.
 
 **Goal:** Give `SessionManager` a way to notify the WebSocket/JSON-RPC layer when things happen, and wire in the file-transfer lifecycle.
 
@@ -257,17 +264,17 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
   - After `handleChatMessagePayload` persistence: `listener.onMessageReceived(message)`.
   - After receipt-driven state update: `listener.onDeliveryStateChanged(messageId, newState)`.
   - After file-transfer handler events: `listener.onFileOfferReceived(...)`, `listener.onFileTransferProgress(...)`.
-- New `sendFile(PeerId, Path)` method — initiates a file offer using `PeerRoutingTable` for address resolution.
+- New `sendFile(PeerId, Path, String direct, String relay)` method — initiates a file offer with explicit target addresses matching `sendChatMessage`.
 - New `acceptFileTransfer(String transferId, Path savePath)` method — accepts a pending file offer and starts chunk retrieval.
 
 **`DefaultFileTransferHandler` implementation:**
 - Consolidates `FileSenderMain`/`FileReceiverMain`'s proven logic into a class that plugs into `SessionManager`.
-- Handles the chunk request/response loop, AES-GCM encryption/decryption, and resume via `StorageService.markChunkReceived()` / `missingChunks()`.
+- Handles the chunk request/response loop, AES-GCM encryption/decryption, resume via `StorageService.markChunkReceived()` / `missingChunks()`, and retry via `StorageService.resetChunkState()`.
 - Calls `DaemonEventListener` at the right points for progress and completion.
 
 **Scope note:** This is the largest sub-milestone. The file-transfer handler is real work — but it's porting already-proven logic from demo Mains, not inventing new mechanics.
 
-**Verification:** Unit tests for `DaemonEventListener` emission (mock listener, verify callbacks). Unit tests for `DefaultFileTransferHandler` chunk logic against real SQLite + real `FileChunker`/`ChunkCipher`. Deferred to M6h: live two-daemon file transfer over real libp2p.
+**Verification:** 9/9 unit tests in `DefaultFileTransferHandlerTest` (single chunk, short last chunk, accept gate, partial restart resumption, hash mismatch, completed offer deduplication, failed retry, outgoing TTL eviction, duplicate accept protection), 9/9 `SessionManagerReceivePipelineTest` cases, and 18/18 `SqliteStorageServiceTest` cases. Deferred to M6h: live two-daemon file transfer over real libp2p.
 
 ---
 

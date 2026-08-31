@@ -19,6 +19,7 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.SQLException;
+import java.time.Duration;
 import java.util.List;
 import java.util.Random;
 import java.util.UUID;
@@ -102,24 +103,35 @@ class DefaultFileTransferHandlerTest {
     @Test
     void resumeAfterSimulatedRestartRequestsOnlyGenuinelyMissingChunks(@TempDir Path tempDir) throws Exception {
         Harness h = new Harness(tempDir, 10);
-        Path sourceFile = h.writeRandomFile("resumable.bin", 55); // 6 chunks
+        Path sourceFile = h.writeRandomFile("resumable.bin", 55); // 6 chunks: indices 0..5
         Path saveFile = h.receiverDir.resolve("received.bin");
 
+        // First attempt: simulate an interruption where only the first 3 chunks (0, 1, 2) arrive before crash
+        h.senderChunkFilter = chunk -> chunk.chunkIndex() < 3;
         String transferId = h.offer(sourceFile);
         h.receiverHandler.acceptFileTransfer(transferId, saveFile);
-        assertThat(h.receiverStorage.missingChunks(transferId, 6)).isEmpty();
+
+        // Chunks 0, 1, 2 received; chunks 3, 4, 5 still missing; transfer state is IN_PROGRESS
+        assertThat(h.receiverStorage.missingChunks(transferId, 6)).containsExactly(3, 4, 5);
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.IN_PROGRESS);
 
         // Simulate a restart: a brand new DefaultFileTransferHandler (fresh in-memory maps), same
-        // StorageService (file_chunk_state genuinely persisted), same already-fully-written file.
-        AtomicInteger chunkRequestsAfterRestart = new AtomicInteger(0);
-        h.onSenderChunkRequestObserved = req -> chunkRequestsAfterRestart.incrementAndGet();
+        // StorageService (file_chunk_state genuinely persisted)
+        AtomicInteger chunksRequestedOnResume = new AtomicInteger(0);
+        h.onSenderChunkRequestObserved = req -> chunksRequestedOnResume.addAndGet(req.missingChunkIndices().length);
         h.rebuildReceiverHandlerSimulatingRestart();
+        h.senderChunkFilter = chunk -> true; // now allow all chunks through
 
+        // Sender re-offers the in-progress transfer
         h.reOffer(transferId, sourceFile);
+
+        // Receiver accepts re-offer: requests ONLY genuinely missing chunks (3, 4, 5)
         h.receiverHandler.acceptFileTransfer(transferId, saveFile);
 
-        assertThat(chunkRequestsAfterRestart).hasValue(0); // everything was already marked received
+        assertThat(chunksRequestedOnResume).hasValue(3); // only chunks 3, 4, 5 were requested
         assertThat(h.receiverStorage.missingChunks(transferId, 6)).isEmpty();
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.COMPLETED);
+        assertThat(Files.readAllBytes(saveFile)).isEqualTo(Files.readAllBytes(sourceFile));
     }
 
     @Test
@@ -152,6 +164,100 @@ class DefaultFileTransferHandlerTest {
         assertThat(Files.readAllBytes(saveFile)).isEqualTo(Files.readAllBytes(sourceFile)); // untouched
     }
 
+    @Test
+    void outgoingTransfersAreEvictedAfterTtlExpires(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+
+        DefaultFileTransferHandler shortTtlHandler = new DefaultFileTransferHandler(
+                h.senderStorage, DaemonEventListener.NONE, Duration.ofMillis(50));
+
+        FileKey key1 = FileKey.generate();
+        shortTtlHandler.registerOutgoingTransfer("t1", sourceFile, key1, 1024, h.receiverId, null, null);
+
+        // Wait for TTL to expire
+        Thread.sleep(80);
+
+        // Registering a new transfer triggers eviction of t1
+        FileKey key2 = FileKey.generate();
+        shortTtlHandler.registerOutgoingTransfer("t2", sourceFile, key2, 1024, h.receiverId, null, null);
+
+        // An incoming chunk request for t1 should now be rejected as unknown/expired
+        AtomicInteger chunksServed = new AtomicInteger(0);
+        shortTtlHandler.attach((target, direct, relay, msg) -> {
+            chunksServed.incrementAndGet();
+            return CompletableFuture.completedFuture(ConnectivityStatus.DIRECT);
+        }, h.senderId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value());
+
+        shortTtlHandler.onFileChunkRequest(h.receiverId, new FileChunkRequestPayload("t1", new int[]{0}));
+        assertThat(chunksServed).hasValue(0); // t1 was evicted
+
+        // But t2 is still active
+        shortTtlHandler.onFileChunkRequest(h.receiverId, new FileChunkRequestPayload("t2", new int[]{0}));
+        assertThat(chunksServed).hasValue(1); // t2 served
+    }
+
+    @Test
+    void duplicateOfferForAlreadyCompletedTransferIsIgnoredQuietly(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 10);
+        Path sourceFile = h.writeRandomFile("completed.bin", 30);
+        Path saveFile = h.receiverDir.resolve("received.bin");
+
+        AtomicInteger offerEvents = new AtomicInteger(0);
+        h.receiverListener = new DaemonEventListener() {
+            @Override
+            public void onFileOfferReceived(String transferId, PeerId sender, String fileName, long fileSize) {
+                offerEvents.incrementAndGet();
+            }
+        };
+
+        String transferId = h.offer(sourceFile);
+        assertThat(offerEvents).hasValue(1);
+
+        h.receiverHandler.acceptFileTransfer(transferId, saveFile);
+        assertThat(Files.readAllBytes(saveFile)).isEqualTo(Files.readAllBytes(sourceFile));
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.COMPLETED);
+
+        // Receiver daemon restarts (clearing in-memory maps)
+        h.rebuildReceiverHandlerSimulatingRestart();
+
+        // Sender re-offers the already-completed transfer
+        h.reOffer(transferId, sourceFile);
+
+        // Event listener should NOT be notified again, and transfer state remains COMPLETED
+        assertThat(offerEvents).hasValue(1);
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.COMPLETED);
+    }
+
+    @Test
+    void failedTransferCanBeRetriedOnReOfferAndSucceeds(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 10);
+        Path sourceFile = h.writeRandomFile("retry-fail.bin", 50);
+        Path saveFile = h.receiverDir.resolve("received.bin");
+
+        // First attempt: override expected file hash so whole-file SHA-256 validation fails
+        h.nextOfferFileHashOverride = "0000000000000000000000000000000000000000000000000000000000000000";
+        String transferId = h.offer(sourceFile);
+        h.receiverHandler.acceptFileTransfer(transferId, saveFile);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.FAILED);
+        assertThat(h.receiverStorage.missingChunks(transferId, 5)).isEmpty(); // all chunks were received before hash check
+
+        // Second attempt (retry): sender re-offers with correct hash
+        h.reOffer(transferId, sourceFile);
+
+        // State is reset to OFFERED and chunk state is cleared
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.OFFERED);
+        assertThat(h.receiverStorage.missingChunks(transferId, 5)).containsExactly(0, 1, 2, 3, 4);
+
+        // Receiver accepts retry
+        h.receiverHandler.acceptFileTransfer(transferId, saveFile);
+
+        // Should complete successfully with matching file content and COMPLETED state
+        assertThat(h.receiverStorage.getTransferState(transferId)).isEqualTo(TransferState.COMPLETED);
+        assertThat(Files.readAllBytes(saveFile)).isEqualTo(Files.readAllBytes(sourceFile));
+    }
+
     // ---------------------------------------------------------------------------------------
 
     /** Wires two independent DefaultFileTransferHandler instances together via a fake transport. */
@@ -168,6 +274,7 @@ class DefaultFileTransferHandlerTest {
         DaemonEventListener receiverListener = DaemonEventListener.NONE;
         Consumer<FileChunkRequestPayload> onSenderChunkRequestObserved = req -> {
         };
+        java.util.function.Predicate<FileChunkPayload> senderChunkFilter = chunk -> true;
         String nextOfferFileHashOverride = null;
 
         private final DaemonEventListener receiverListenerDelegate = new DaemonEventListener() {
@@ -244,7 +351,9 @@ class DefaultFileTransferHandlerTest {
 
         CompletableFuture<ConnectivityStatus> routeFromSender(PeerId target, String direct, String relay, FileTransferMessage message) {
             if (message instanceof FileChunkPayload chunk) {
-                receiverHandler.onFileChunk(senderId, chunk);
+                if (senderChunkFilter.test(chunk)) {
+                    receiverHandler.onFileChunk(senderId, chunk);
+                }
             }
             return CompletableFuture.completedFuture(ConnectivityStatus.DIRECT);
         }

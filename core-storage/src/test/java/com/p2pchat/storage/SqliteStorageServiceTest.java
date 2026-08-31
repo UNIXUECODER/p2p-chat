@@ -357,4 +357,24 @@ class SqliteStorageServiceTest {
         assertThat(routes).extracting(PeerRoute::peerId)
                 .containsExactly(new PeerId("peer-new"), new PeerId("peer-old"));
     }
+
+    @Test
+    void getTransferStateAndResetChunkState() {
+        assertThat(storageService.getTransferState("unknown")).isNull();
+
+        FileTransfer transfer = new FileTransfer("t1", "c1", "test.bin", 100, "hash", 10, 10, TransferState.OFFERED, null, 1000L);
+        storageService.saveFileMetadata(transfer);
+        assertThat(storageService.getTransferState("t1")).isEqualTo(TransferState.OFFERED);
+
+        storageService.updateTransferState("t1", TransferState.FAILED);
+        assertThat(storageService.getTransferState("t1")).isEqualTo(TransferState.FAILED);
+
+        storageService.markChunkReceived("t1", 0);
+        storageService.markChunkReceived("t1", 1);
+        assertThat(storageService.missingChunks("t1", 2)).isEmpty();
+
+        storageService.resetChunkState("t1");
+        assertThat(storageService.getTransferState("t1")).isEqualTo(TransferState.OFFERED);
+        assertThat(storageService.missingChunks("t1", 2)).containsExactly(0, 1);
+    }
 }

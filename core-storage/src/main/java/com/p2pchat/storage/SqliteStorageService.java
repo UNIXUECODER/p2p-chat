@@ -134,6 +134,33 @@ public final class SqliteStorageService implements StorageService {
     }
 
     @Override
+    public TransferState getTransferState(String transferId) {
+        String sql = "SELECT state FROM file_transfers WHERE transfer_id = ?";
+        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+            statement.setString(1, transferId);
+            try (ResultSet resultSet = statement.executeQuery()) {
+                return resultSet.next() ? TransferState.valueOf(resultSet.getString("state")) : null;
+            }
+        } catch (SQLException e) {
+            throw new RuntimeException("Failed to get transfer state for " + transferId, e);
+        }
+    }
+
+    @Override
+    public void resetChunkState(String transferId) {
+        runInTransaction(() -> {
+            String sqlChunks = "DELETE FROM file_chunk_state WHERE transfer_id = ?";
+            runUpdate(sqlChunks, statement -> statement.setString(1, transferId));
+            String sqlTransfer = "UPDATE file_transfers SET state = ? WHERE transfer_id = ?";
+            runUpdate(sqlTransfer, statement -> {
+                statement.setString(1, TransferState.OFFERED.name());
+                statement.setString(2, transferId);
+            });
+            return null;
+        });
+    }
+
+    @Override
     public void saveConversation(Conversation conversation) {
         // INSERT OR IGNORE, same reasoning as saveFileMetadata: messages has a foreign key on
         // conversations(conversation_id) (see V001__init.sql), so saveMessage requires this row

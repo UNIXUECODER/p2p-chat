@@ -64,4 +64,43 @@ class PeerRoutingTableTest {
         assertThat(routes).extracting(PeerRoute::peerId)
                 .containsExactlyInAnyOrder(new PeerId("peer-a"), new PeerId("peer-b"));
     }
+
+    @Test
+    void routesSurviveRestartAcrossDatabaseReopen(@TempDir Path tempDir) throws SQLException {
+        PeerId peerId = new PeerId("peer-restart-123");
+        byte[] preKeyBundle = new byte[]{1, 2, 3, 4, 5, 6, 7, 8};
+        PeerRoute initial = new PeerRoute(
+                peerId,
+                "/ip4/192.168.1.50/tcp/9000",
+                "/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWRelay",
+                "Alice",
+                preKeyBundle,
+                1700000000L
+        );
+
+        // Open first database instance, persist the route, then close it cleanly (simulating daemon shutdown)
+        try (SqliteDatabase db1 = SqliteDatabase.openOrCreate(tempDir)) {
+            PeerRoutingTable table1 = new PeerRoutingTable(new SqliteStorageService(db1));
+            table1.upsert(initial);
+            assertThat(table1.get(peerId)).isEqualTo(initial);
+        }
+
+        // Open a brand-new database instance against the exact same directory (simulating daemon restart)
+        try (SqliteDatabase db2 = SqliteDatabase.openOrCreate(tempDir)) {
+            PeerRoutingTable table2 = new PeerRoutingTable(new SqliteStorageService(db2));
+            PeerRoute restored = table2.get(peerId);
+
+            assertThat(restored).isNotNull();
+            assertThat(restored.peerId()).isEqualTo(peerId);
+            assertThat(restored.directMultiaddr()).isEqualTo("/ip4/192.168.1.50/tcp/9000");
+            assertThat(restored.relayMultiaddr()).isEqualTo("/ip4/10.0.0.1/tcp/4001/p2p/12D3KooWRelay");
+            assertThat(restored.displayName()).isEqualTo("Alice");
+            assertThat(restored.preKeyBundle()).isEqualTo(preKeyBundle);
+            assertThat(restored.lastSeen()).isEqualTo(1700000000L);
+
+            List<PeerRoute> routes = table2.list();
+            assertThat(routes).hasSize(1);
+            assertThat(routes.get(0)).isEqualTo(restored);
+        }
+    }
 }

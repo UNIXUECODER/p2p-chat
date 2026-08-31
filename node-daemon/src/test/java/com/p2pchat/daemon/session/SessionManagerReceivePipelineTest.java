@@ -1,5 +1,10 @@
 package com.p2pchat.daemon.session;
 
+import com.p2pchat.daemon.dispatch.ApplicationMessageRouter;
+import com.p2pchat.daemon.dispatch.DispatchedMessage;
+import com.p2pchat.filetransfer.FileChunker;
+import com.p2pchat.filetransfer.FileKey;
+import com.p2pchat.filetransfer.wire.FileOfferPayload;
 import com.p2pchat.messaging.HlcTimestamp;
 import com.p2pchat.messaging.HybridLogicalClock;
 import com.p2pchat.messaging.wire.ChatMessageCodec;
@@ -7,6 +12,7 @@ import com.p2pchat.messaging.wire.ChatMessagePayload;
 import com.p2pchat.messaging.wire.DeliveryReceiptPayload;
 import com.p2pchat.messaging.wire.ReadReceiptPayload;
 import com.p2pchat.model.PeerId;
+import com.p2pchat.network.ConnectivityStatus;
 import com.p2pchat.storage.SqliteDatabase;
 import com.p2pchat.storage.SqliteStorageService;
 import com.p2pchat.storage.model.DeliveryState;
@@ -18,13 +24,16 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
  * M6e-2. {@code SessionManager.handleDecryptedPlaintext} is the seam this project's testable-
@@ -259,6 +268,126 @@ class SessionManagerReceivePipelineTest {
         } finally {
             sm.close();
         }
+    }
+
+    // ---- M6g-3: Direct unit tests for SessionManager.sendFile and SessionManager.acceptFileTransfer
+
+    @Test
+    void sendFileRejectsNonExistentFileWithUnreachableStatus(@TempDir Path tempDir) throws Exception {
+        Path missingFile = tempDir.resolve("missing.bin");
+        CompletableFuture<ConnectivityStatus> future = sessionManager.sendFile(
+                senderPeerId, senderAddress, null, missingFile);
+
+        assertThat(future.get()).isEqualTo(ConnectivityStatus.UNREACHABLE);
+        assertThat(fakeNetwork.sentTo()).isEmpty();
+    }
+
+    @Test
+    void sendFileRegistersOutgoingTransferEncryptsOfferAndSendsOutbound(@TempDir Path tempDir) throws Exception {
+        Path testFile = tempDir.resolve("send-test.bin");
+        byte[] fileBytes = new byte[750];
+        new java.util.Random(123).nextBytes(fileBytes);
+        Files.write(testFile, fileBytes);
+
+        class CapturingFileTransferHandler implements FileTransferHandler {
+            String registeredTransferId;
+            Path registeredPath;
+            FileKey registeredKey;
+            int registeredChunkSize;
+            PeerId registeredTarget;
+
+            @Override
+            public void registerOutgoingTransfer(String transferId, Path sourceFile, FileKey fileKey, int chunkSize,
+                                                 PeerId targetPeerId, String targetDirectMultiaddr, String targetRelayMultiaddr) {
+                this.registeredTransferId = transferId;
+                this.registeredPath = sourceFile;
+                this.registeredKey = fileKey;
+                this.registeredChunkSize = chunkSize;
+                this.registeredTarget = targetPeerId;
+            }
+        }
+
+        CapturingFileTransferHandler capturingHandler = new CapturingFileTransferHandler();
+        SessionManager sm = new SessionManager(fakeNetwork, storage, null, capturingHandler);
+        sm.initializeForTesting(ownPeerId, "/ip4/127.0.0.1/tcp/9200/p2p/" + ownPeerId.value(),
+                new HybridLogicalClock(ownPeerId.value()), fakeSessions);
+
+        try {
+            CompletableFuture<ConnectivityStatus> future = sm.sendFile(
+                    senderPeerId, senderAddress, null, testFile);
+
+            assertThat(future.get()).isEqualTo(ConnectivityStatus.DIRECT);
+            assertThat(capturingHandler.registeredTransferId).isNotNull();
+            assertThat(capturingHandler.registeredPath).isEqualTo(testFile);
+            assertThat(capturingHandler.registeredKey).isNotNull();
+            assertThat(capturingHandler.registeredKey.bytes()).hasSize(32);
+            assertThat(capturingHandler.registeredChunkSize).isEqualTo(FileChunker.DEFAULT_CHUNK_SIZE_BYTES);
+            assertThat(capturingHandler.registeredTarget).isEqualTo(senderPeerId);
+
+            // Outbound send occurred
+            awaitSentCount(1);
+            assertThat(fakeNetwork.sentTo()).contains(senderAddress);
+
+            // Decode the encrypted plaintext passed to fakeSessions.encrypt
+            byte[] encryptedOfferPlaintext = fakeSessions.encryptedPlaintexts().get(fakeSessions.encryptedPlaintexts().size() - 1);
+            DispatchedMessage dispatched = ApplicationMessageRouter.dispatch(encryptedOfferPlaintext);
+            assertThat(dispatched).isInstanceOf(DispatchedMessage.FileTransfer.class);
+            com.p2pchat.filetransfer.wire.FileTransferMessage ftMessage = ((DispatchedMessage.FileTransfer) dispatched).message();
+            assertThat(ftMessage).isInstanceOf(FileOfferPayload.class);
+            FileOfferPayload offer = (FileOfferPayload) ftMessage;
+
+            assertThat(offer.transferId()).isEqualTo(capturingHandler.registeredTransferId);
+            assertThat(offer.fileName()).isEqualTo("send-test.bin");
+            assertThat(offer.fileSize()).isEqualTo(750L);
+            assertThat(offer.fileHash()).isEqualTo(FileChunker.sha256HexOfFile(testFile));
+            assertThat(offer.totalChunks()).isEqualTo(1);
+            assertThat(offer.fileKey()).isEqualTo(capturingHandler.registeredKey.bytes());
+        } finally {
+            sm.close();
+        }
+    }
+
+    @Test
+    void acceptFileTransferDelegatesDirectlyToFileTransferHandler(@TempDir Path tempDir) {
+        java.util.concurrent.atomic.AtomicReference<String> acceptedTransferId = new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<Path> acceptedPath = new java.util.concurrent.atomic.AtomicReference<>();
+
+        FileTransferHandler handler = new FileTransferHandler() {
+            @Override
+            public void acceptFileTransfer(String transferId, Path savePath) {
+                acceptedTransferId.set(transferId);
+                acceptedPath.set(savePath);
+            }
+        };
+
+        SessionManager sm = new SessionManager(fakeNetwork, storage, null, handler);
+        sm.initializeForTesting(ownPeerId, "/ip4/127.0.0.1/tcp/9200/p2p/" + ownPeerId.value(),
+                new HybridLogicalClock(ownPeerId.value()), fakeSessions);
+
+        try {
+            Path dest = tempDir.resolve("saved.bin");
+            sm.acceptFileTransfer("transfer-999", dest);
+
+            assertThat(acceptedTransferId.get()).isEqualTo("transfer-999");
+            assertThat(acceptedPath.get()).isEqualTo(dest);
+        } finally {
+            sm.close();
+        }
+    }
+
+    @Test
+    void sendFileAndAcceptFileTransferThrowIllegalStateExceptionBeforeStart(@TempDir Path tempDir) {
+        SessionManager unstarted = new SessionManager(fakeNetwork, storage, null, new FileTransferHandler() {
+        });
+        Path dummy = tempDir.resolve("dummy.bin");
+
+        assertThatThrownBy(() -> unstarted.sendFile(senderPeerId, senderAddress, null, dummy))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be called before use");
+
+        assertThatThrownBy(() -> unstarted.acceptFileTransfer("t1", dummy))
+                .isInstanceOf(IllegalStateException.class)
+                .hasMessageContaining("must be called before use");
     }
 
     // ---------------------------------------------------------------- raw SQL verification helpers

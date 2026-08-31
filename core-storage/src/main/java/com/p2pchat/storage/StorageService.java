@@ -91,6 +91,20 @@ public interface StorageService {
     void updateTransferState(String transferId, TransferState newState);
 
     /**
+     * Returns the current {@link TransferState} of the specified {@code transferId}, or {@code null}
+     * if no file transfer record with this ID exists.
+     */
+    TransferState getTransferState(String transferId);
+
+    /**
+     * Resets chunk tracking and transfer state for {@code transferId} — deletes all rows from
+     * {@code file_chunk_state} for this transfer and resets {@code file_transfers.state} back to
+     * {@link TransferState#OFFERED}. Used when retrying a previously {@link TransferState#FAILED}
+     * transfer so that fresh chunk requests can be issued from scratch.
+     */
+    void resetChunkState(String transferId);
+
+    /**
      * Inserts a conversation. Safe to call more than once for the same {@code conversationId}
      * (existing rows are left untouched, not overwritten) — same upsert reasoning as
      * {@link #saveFileMetadata}: a 1:1 conversation with a given contact is naturally

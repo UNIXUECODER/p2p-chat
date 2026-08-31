@@ -62,4 +62,23 @@ public record PeerRoute(
     public boolean hasPreKeyBundle() {
         return preKeyBundle != null && preKeyBundle.length > 0;
     }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (!(o instanceof PeerRoute other)) return false;
+        return lastSeen == other.lastSeen
+                && java.util.Objects.equals(peerId, other.peerId)
+                && java.util.Objects.equals(directMultiaddr, other.directMultiaddr)
+                && java.util.Objects.equals(relayMultiaddr, other.relayMultiaddr)
+                && java.util.Objects.equals(displayName, other.displayName)
+                && java.util.Arrays.equals(preKeyBundle, other.preKeyBundle);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = java.util.Objects.hash(peerId, directMultiaddr, relayMultiaddr, displayName, lastSeen);
+        result = 31 * result + java.util.Arrays.hashCode(preKeyBundle);
+        return result;
+    }
 }

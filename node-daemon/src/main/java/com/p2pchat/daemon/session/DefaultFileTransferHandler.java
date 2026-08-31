@@ -15,6 +15,7 @@ import com.p2pchat.storage.model.TransferState;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -84,8 +85,11 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 public final class DefaultFileTransferHandler implements FileTransferHandler {
 
+    public static final Duration DEFAULT_OUTGOING_TRANSFER_TTL = Duration.ofHours(24);
+
     private final StorageService storage;
     private final DaemonEventListener eventListener;
+    private final Duration outgoingTransferTtl;
 
     // Set once via attach() -- see that method's own Javadoc for why these can't be constructor
     // parameters the same way SessionManager's own ownPeerId/sessions can't be.
@@ -102,8 +106,13 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
     private final Map<String, IncomingTransfer> incomingTransfers = new ConcurrentHashMap<>();
 
     public DefaultFileTransferHandler(StorageService storage, DaemonEventListener eventListener) {
+        this(storage, eventListener, DEFAULT_OUTGOING_TRANSFER_TTL);
+    }
+
+    public DefaultFileTransferHandler(StorageService storage, DaemonEventListener eventListener, Duration outgoingTransferTtl) {
         this.storage = storage;
         this.eventListener = eventListener;
+        this.outgoingTransferTtl = outgoingTransferTtl != null ? outgoingTransferTtl : DEFAULT_OUTGOING_TRANSFER_TTL;
     }
 
     @Override
@@ -116,8 +125,14 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
     @Override
     public void registerOutgoingTransfer(String transferId, Path sourceFile, FileKey fileKey, int chunkSize,
                                           PeerId targetPeerId, String targetDirectMultiaddr, String targetRelayMultiaddr) {
+        evictExpiredOutgoingTransfers();
         outgoingTransfers.put(transferId, new OutgoingTransfer(
                 sourceFile, fileKey, chunkSize, targetPeerId, targetDirectMultiaddr, targetRelayMultiaddr));
+    }
+
+    private void evictExpiredOutgoingTransfers() {
+        long cutoff = System.currentTimeMillis() - outgoingTransferTtl.toMillis();
+        outgoingTransfers.entrySet().removeIf(entry -> entry.getValue().lastActivityEpochMs < cutoff);
     }
 
     @Override
@@ -130,6 +145,16 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
             // hypothetical one.
             System.out.println("[file] duplicate offer for already-accepted transfer " + offer.transferId() + " - ignoring");
             return;
+        }
+
+        TransferState persistedState = storage.getTransferState(offer.transferId());
+        if (persistedState == TransferState.COMPLETED) {
+            System.out.println("[file] duplicate offer for already-COMPLETED transfer " + offer.transferId() + " - ignoring");
+            return;
+        }
+        if (persistedState == TransferState.FAILED) {
+            System.out.println("[file] re-offer for previously-FAILED transfer " + offer.transferId() + " - resetting chunk state for retry");
+            storage.resetChunkState(offer.transferId());
         }
 
         IncomingTransfer transfer = new IncomingTransfer(
@@ -164,7 +189,13 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
             System.out.println("[file] acceptFileTransfer for unknown/expired offer " + transferId + " - ignoring");
             return;
         }
-        transfer.outputFile = savePath;
+        synchronized (transfer) {
+            if (transfer.outputFile != null) {
+                System.out.println("[file] acceptFileTransfer called for already-accepted transfer " + transferId + " - ignoring");
+                return;
+            }
+            transfer.outputFile = savePath;
+        }
         storage.updateTransferState(transferId, TransferState.ACCEPTED);
 
         List<Integer> missing = storage.missingChunks(transferId, transfer.totalChunks);
@@ -186,6 +217,7 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
             System.out.println("[file] chunk request for unknown transfer " + request.transferId() + " - ignoring");
             return;
         }
+        transfer.lastActivityEpochMs = System.currentTimeMillis();
         System.out.println("[file] chunk request received: " + request.missingChunkIndices().length + " chunk(s) requested");
 
         // Sent one at a time, each waiting for the previous to complete, rather than firing all
@@ -211,19 +243,28 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
     @Override
     public void onFileChunk(PeerId sender, FileChunkPayload chunk) {
         IncomingTransfer transfer = incomingTransfers.get(chunk.transferId());
-        if (transfer == null || transfer.outputFile == null) {
+        if (transfer == null) {
+            System.out.println("[file] chunk for unknown transfer " + chunk.transferId() + " - ignoring");
+            return;
+        }
+
+        Path destination;
+        synchronized (transfer) {
+            destination = transfer.outputFile;
+        }
+        if (destination == null) {
             // Either genuinely unknown, or a chunk arriving for a transfer this daemon hasn't
             // (or hasn't yet) accepted -- in normal operation a peer only ever sends chunks in
             // response to a request this daemon itself sent from acceptFileTransfer, so this
             // path means a stale/unsolicited send, not something to act on.
-            System.out.println("[file] chunk for unknown/not-yet-accepted transfer " + chunk.transferId() + " - ignoring");
+            System.out.println("[file] chunk for not-yet-accepted transfer " + chunk.transferId() + " - ignoring");
             return;
         }
 
         EncryptedChunk encrypted = new EncryptedChunk(chunk.chunkIndex(), chunk.nonce(), chunk.ciphertext());
         byte[] plaintext = ChunkCipher.decrypt(transfer.fileKey, encrypted); // throws (unchecked) on tamper -- caught by SessionManager's own outer catch, same as any other malformed inbound data
 
-        try (RandomAccessFile raf = new RandomAccessFile(transfer.outputFile.toFile(), "rw")) {
+        try (RandomAccessFile raf = new RandomAccessFile(destination.toFile(), "rw")) {
             raf.seek((long) chunk.chunkIndex() * transfer.chunkSize);
             raf.write(plaintext);
         } catch (Exception e) {
@@ -246,26 +287,34 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
 
     private void completeTransfer(String transferId, IncomingTransfer transfer) {
         try {
-            if (!Files.exists(transfer.outputFile)) {
+            Path destination;
+            synchronized (transfer) {
+                destination = transfer.outputFile;
+            }
+            if (destination != null && !Files.exists(destination)) {
                 // Every chunk is already marked received in storage, but nothing has actually
                 // been written to disk yet -- true only when accept-time found zero missing
                 // chunks with no prior write ever having happened (a pathological "already fully
                 // resumed, output file never created" edge case). Create an empty placeholder so
                 // sha256HexOfFile below has something to hash rather than throwing.
-                Files.createFile(transfer.outputFile);
+                Files.createFile(destination);
             }
-            String actualHash = FileChunker.sha256HexOfFile(transfer.outputFile);
+            String actualHash = destination != null ? FileChunker.sha256HexOfFile(destination) : "";
             boolean hashMatches = actualHash.equals(transfer.fileHash);
             TransferState finalState = hashMatches ? TransferState.COMPLETED : TransferState.FAILED;
             storage.updateTransferState(transferId, finalState);
 
-            System.out.println("[file] transfer " + transferId + " complete: " + transfer.outputFile
+            System.out.println("[file] transfer " + transferId + " complete: " + destination
                     + " - " + (hashMatches ? "hash verified" : "HASH MISMATCH, marked FAILED"));
             eventListener.onFileTransferProgress(transferId, transfer.totalChunks, transfer.totalChunks, finalState);
         } catch (Exception e) {
             System.out.println("[file] FAILED to finalize transfer " + transferId + ": " + e);
             storage.updateTransferState(transferId, TransferState.FAILED);
             eventListener.onFileTransferProgress(transferId, transfer.totalChunks, transfer.totalChunks, TransferState.FAILED);
+        } finally {
+            // Evict completed transfer from in-memory map to prevent unbounded memory growth.
+            // Historical record remains in storage (file_transfers table).
+            incomingTransfers.remove(transferId);
         }
     }
 
@@ -296,6 +345,8 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
         final PeerId targetPeerId;
         final String targetDirectMultiaddr;
         final String targetRelayMultiaddr;
+        final long createdAtEpochMs;
+        volatile long lastActivityEpochMs;
 
         OutgoingTransfer(Path sourceFile, FileKey fileKey, int chunkSize, PeerId targetPeerId,
                           String targetDirectMultiaddr, String targetRelayMultiaddr) {
@@ -305,6 +356,8 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
             this.targetPeerId = targetPeerId;
             this.targetDirectMultiaddr = targetDirectMultiaddr;
             this.targetRelayMultiaddr = targetRelayMultiaddr;
+            this.createdAtEpochMs = System.currentTimeMillis();
+            this.lastActivityEpochMs = this.createdAtEpochMs;
         }
     }
 
