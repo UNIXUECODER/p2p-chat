@@ -6,7 +6,9 @@ import com.p2pchat.crypto.SignalIdentity;
 import com.p2pchat.crypto.SignalIdentityVault;
 import com.p2pchat.daemon.crypto.SqliteSignalProtocolStore;
 import com.p2pchat.daemon.crypto.SynchronizedSignalProtocolStore;
+import com.p2pchat.daemon.session.DefaultFileTransferHandler;
 import com.p2pchat.daemon.session.FileTransferHandler;
+import com.p2pchat.daemon.session.PrintingDaemonEventListener;
 import com.p2pchat.daemon.session.SessionManager;
 import com.p2pchat.identity.Identity;
 import com.p2pchat.identity.IdentityService;
@@ -48,6 +50,18 @@ import java.util.Base64;
  * IDs, storage's {@code sender_peer_id}, remote addresses) — not because {@code ChatListenerMain}
  * was proven broken, but because this was already flagged as the mismatch to actually fix once a
  * session manager existed to fix it in.
+ *
+ * <p><b>M6g-3 checkpoint amendment.</b> Through M6g-3, this Main constructed a bare {@code new
+ * FileTransferHandler() {}} no-op and never passed a {@code DaemonEventListener} at all — so
+ * {@code DefaultFileTransferHandler} (M6g-3) and every {@code DaemonEventListener} callback had
+ * only ever been exercised against fakes in unit tests, never for real between two processes.
+ * Now wires in the real {@link com.p2pchat.daemon.session.DefaultFileTransferHandler} and a
+ * real, printing {@link com.p2pchat.daemon.session.PrintingDaemonEventListener} (which
+ * auto-accepts inbound file offers, since there is no UI here to ask a person) — see that
+ * class's own Javadoc for the full reasoning. Run {@code SessionManagerSenderMain} with {@code
+ * -Pfile=<path>} against this listener to exercise the whole path: offer → auto-accept → chunk
+ * request → chunk receive → hash verify, plus every {@code DaemonEventListener} callback along
+ * the way, printed to this process's own console.
  */
 public class SessionManagerListenerMain {
 
@@ -76,16 +90,28 @@ public class SessionManagerListenerMain {
 
         StorageService storage = new SqliteStorageService(database);
         PeerNetworkService network = new Libp2pNetworkService();
-        FileTransferHandler fileTransferHandler = new FileTransferHandler() {
-        }; // file transfer is explicitly out of M6e-2's scope -- see SessionManager's own Javadoc
 
-        SessionManager sessionManager = new SessionManager(network, storage, synchronizedStore, fileTransferHandler);
+        // M6g-3 checkpoint: real file-transfer handler + real event listener, not the no-op/NONE
+        // pair every prior demo of this class used -- see the class Javadoc and
+        // PrintingDaemonEventListener's own Javadoc for why this changed now.
+        Path downloadDir = baseDir.resolve("received-files");
+        Files.createDirectories(downloadDir);
+        PrintingDaemonEventListener eventListener = new PrintingDaemonEventListener(downloadDir);
+        FileTransferHandler fileTransferHandler = new DefaultFileTransferHandler(storage, eventListener);
+
+        SessionManager sessionManager =
+                new SessionManager(network, storage, synchronizedStore, fileTransferHandler, eventListener);
+        // Must happen before start() -- see PrintingDaemonEventListener's own Javadoc on why
+        // this ordering is a real requirement, not just tidiness.
+        eventListener.attachSessionManager(sessionManager);
         sessionManager.start(port, identityService.rawPrivateKeySeed());
 
         System.out.println("Listening on port " + port + ", peer id " + sessionManager.localPeerId().value());
         System.out.println("Bundle published to " + bundleFile.toAbsolutePath());
+        System.out.println("Incoming files will be auto-accepted and saved under " + downloadDir.toAbsolutePath());
         System.out.println("Run SessionManagerSenderMain against this process as many times, from as many");
         System.out.println("different -Ddatadir values, as you want -- one listener, any number of concurrent senders.");
+        System.out.println("Add -Pfile=<path> to a SessionManagerSenderMain run to also exercise file transfer.");
         System.out.println("Press Ctrl+C to stop.");
 
         Runtime.getRuntime().addShutdownHook(new Thread(sessionManager::close));

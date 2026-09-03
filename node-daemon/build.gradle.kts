@@ -355,7 +355,9 @@ tasks.register<JavaExec>("runChatSender") {
 // isolated multi-peer sessions -- the actual new capability this milestone adds.
 tasks.register<JavaExec>("runSessionManagerListener") {
     group = "p2p-chat"
-    description = "M6e-2: multi-session daemon core, listener side. Optional: -Pport=9300 -Pdatadir=.p2p-chat-data"
+    description = "M6e-2/M6g-3: multi-session daemon core, listener side -- now auto-accepts inbound file offers " +
+            "and saves them under <datadir>/received-files (see PrintingDaemonEventListener). " +
+            "Optional: -Pport=9300 -Pdatadir=.p2p-chat-data"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.SessionManagerListenerMain")
     args = listOf((project.findProperty("port") as String?) ?: "9300")
@@ -364,16 +366,22 @@ tasks.register<JavaExec>("runSessionManagerListener") {
 
 tasks.register<JavaExec>("runSessionManagerSender") {
     group = "p2p-chat"
-    description = "M6e-2: multi-session daemon core, sender side. Required: -Paddr=... -Pbundlefile=... -Pmessage=... " +
-            "Optional: -Pport=9301 -Pdatadir=.p2p-chat-data"
+    description = "M6e-2/M6g-3: multi-session daemon core, sender side. Required: -Paddr=... -Pbundlefile=... -Pmessage=... " +
+            "Optional: -Pport=9301 -Pdatadir=.p2p-chat-data -Pfile=\"<path>\" (also offers this file to the target " +
+            "via SessionManager.sendFile/DefaultFileTransferHandler, auto-accepted on the listener side -- M6g-3 checkpoint)"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.SessionManagerSenderMain")
     val addrArg = project.findProperty("addr") as String?
     val bundlefileArg = project.findProperty("bundlefile") as String?
     val messageArg = project.findProperty("message") as String?
     val portArg = (project.findProperty("port") as String?) ?: "9301"
+    val fileArg = project.findProperty("file") as String?
     if (addrArg != null && bundlefileArg != null && messageArg != null) {
-        args = listOf(addrArg, bundlefileArg, messageArg, portArg)
+        args = if (fileArg != null) {
+            listOf(addrArg, bundlefileArg, messageArg, portArg, fileArg)
+        } else {
+            listOf(addrArg, bundlefileArg, messageArg, portArg)
+        }
     }
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }

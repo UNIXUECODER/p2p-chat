@@ -215,13 +215,16 @@ public final class SessionManager implements AutoCloseable {
      * bundle supplied "just in case" is never used to redundantly (and incorrectly) re-establish
      * an existing session.
      *
-     * @return a future that always resolves to a {@link ConnectivityStatus}, never completes
+     * @return a future that always resolves to a {@link ChatSendResult}, never completes
      *         exceptionally — extending {@link OutboundMessageService}'s own stated guarantee to
      *         cover the crypto/storage steps this method adds in front of it, not just the send.
+     *         M6g-4 update: previously returned a bare {@link ConnectivityStatus}; see {@link
+     *         ChatSendResult}'s own Javadoc for why that changed and what its {@code messageId}
+     *         field does and does not guarantee.
      */
-    public CompletableFuture<ConnectivityStatus> sendChatMessage(PeerId targetPeerId, String directMultiaddr,
-                                                                  String relayMultiaddr, PreKeyBundle bundleIfNoSessionYet,
-                                                                  String conversationId, String text) {
+    public CompletableFuture<ChatSendResult> sendChatMessage(PeerId targetPeerId, String directMultiaddr,
+                                                              String relayMultiaddr, PreKeyBundle bundleIfNoSessionYet,
+                                                              String conversationId, String text) {
         requireStarted();
         SignalProtocolAddress remote = new SignalProtocolAddress(targetPeerId.value(), 1);
         String messageId = UUID.randomUUID().toString();
@@ -255,13 +258,16 @@ public final class SessionManager implements AutoCloseable {
                         // send worked, not just that an attempt was recorded.
                         storage.updateDeliveryState(messageId,
                                 status == ConnectivityStatus.UNREACHABLE ? DeliveryState.FAILED : DeliveryState.SENT);
-                        return status;
+                        return new ChatSendResult(messageId, status);
                     });
         } catch (Exception e) {
             // Same principle as ConnectionStrategy/OutboundMessageService: a failure this early
             // (session establishment, encryption) still resolves to a definitive status rather
-            // than throwing out of this method.
-            return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+            // than throwing out of this method. messageId is still reported -- it was generated
+            // above, before this try block -- but see ChatSendResult's own Javadoc for why this
+            // specific path means it was never actually persisted, unlike the ordinary
+            // UNREACHABLE case this catch block is NOT the only way to reach.
+            return CompletableFuture.completedFuture(new ChatSendResult(messageId, ConnectivityStatus.UNREACHABLE));
         }
     }
 
@@ -286,15 +292,24 @@ public final class SessionManager implements AutoCloseable {
      * not a silent omission, matching this project's established practice for exactly this shape
      * of decision.
      *
-     * @return a future that always resolves to a {@link ConnectivityStatus}, matching {@link
+     * <p><b>M6g-4 update: now returns the generated {@code transferId}.</b> Previously returned a
+     * bare {@link ConnectivityStatus}, mirroring {@link #sendChatMessage}'s shape — but building
+     * the {@code files.send} JSON-RPC method against it (§7: returns {@code { transferId }})
+     * found that gap directly: this method already generates a {@code transferId} internally and
+     * hands it to {@link #fileTransferHandler} for its own bookkeeping, but never returned it, so
+     * a caller had no way to learn which transfer their own offer became. See {@link
+     * FileSendResult}'s own Javadoc for the full reasoning, including why a caller-generated id
+     * could not have substituted for this fix.
+     *
+     * @return a future that always resolves to a {@link FileSendResult}, matching {@link
      *         #sendChatMessage}'s own guarantee — never completes exceptionally.
      */
-    public CompletableFuture<ConnectivityStatus> sendFile(PeerId targetPeerId, String directMultiaddr,
-                                                            String relayMultiaddr, Path filePath) {
+    public CompletableFuture<FileSendResult> sendFile(PeerId targetPeerId, String directMultiaddr,
+                                                        String relayMultiaddr, Path filePath) {
         requireStarted();
         try {
             if (!Files.isRegularFile(filePath)) {
-                return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+                return CompletableFuture.completedFuture(new FileSendResult(null, ConnectivityStatus.UNREACHABLE));
             }
             int chunkSize = FileChunker.DEFAULT_CHUNK_SIZE_BYTES;
             long fileSize = Files.size(filePath);
@@ -313,11 +328,16 @@ public final class SessionManager implements AutoCloseable {
             EncryptedFrame frame = sessions.encrypt(remote, FileTransferMessageCodec.encode(offer));
             byte[] wire = EncryptedFrameCodec.encode(frame);
 
-            return outbound.send(directMultiaddr, relayMultiaddr, targetPeerId.value(), wire);
+            return outbound.send(directMultiaddr, relayMultiaddr, targetPeerId.value(), wire)
+                    .thenApply(status -> new FileSendResult(transferId, status));
         } catch (Exception e) {
             // Same principle as sendChatMessage: a failure this early still resolves to a
-            // definitive status rather than throwing out of this method.
-            return CompletableFuture.completedFuture(ConnectivityStatus.UNREACHABLE);
+            // definitive status rather than throwing out of this method. transferId is null here
+            // deliberately, not the local variable above (which may be unset depending on where
+            // the exception was thrown from) -- a caller receiving UNREACHABLE has no use for a
+            // transferId that may or may not correspond to anything FileTransferHandler actually
+            // registered, so this never reports one it isn't certain about.
+            return CompletableFuture.completedFuture(new FileSendResult(null, ConnectivityStatus.UNREACHABLE));
         }
     }
 

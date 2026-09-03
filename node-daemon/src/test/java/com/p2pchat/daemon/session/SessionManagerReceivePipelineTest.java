@@ -275,10 +275,14 @@ class SessionManagerReceivePipelineTest {
     @Test
     void sendFileRejectsNonExistentFileWithUnreachableStatus(@TempDir Path tempDir) throws Exception {
         Path missingFile = tempDir.resolve("missing.bin");
-        CompletableFuture<ConnectivityStatus> future = sessionManager.sendFile(
+        CompletableFuture<FileSendResult> future = sessionManager.sendFile(
                 senderPeerId, senderAddress, null, missingFile);
 
-        assertThat(future.get()).isEqualTo(ConnectivityStatus.UNREACHABLE);
+        FileSendResult result = future.get();
+        assertThat(result.status()).isEqualTo(ConnectivityStatus.UNREACHABLE);
+        // M6g-4: no transfer was ever registered for a file that doesn't exist -- see
+        // FileSendResult's own Javadoc for why null here is deliberate, not an oversight.
+        assertThat(result.transferId()).isNull();
         assertThat(fakeNetwork.sentTo()).isEmpty();
     }
 
@@ -313,10 +317,15 @@ class SessionManagerReceivePipelineTest {
                 new HybridLogicalClock(ownPeerId.value()), fakeSessions);
 
         try {
-            CompletableFuture<ConnectivityStatus> future = sm.sendFile(
+            CompletableFuture<FileSendResult> future = sm.sendFile(
                     senderPeerId, senderAddress, null, testFile);
 
-            assertThat(future.get()).isEqualTo(ConnectivityStatus.DIRECT);
+            FileSendResult result = future.get();
+            assertThat(result.status()).isEqualTo(ConnectivityStatus.DIRECT);
+            // M6g-4: the transferId sendFile hands back must be the SAME one it registered with
+            // FileTransferHandler -- not merely non-null. This is the exact bug FileSendResult's
+            // own Javadoc names as the risk a caller-generated id would have created.
+            assertThat(result.transferId()).isEqualTo(capturingHandler.registeredTransferId);
             assertThat(capturingHandler.registeredTransferId).isNotNull();
             assertThat(capturingHandler.registeredPath).isEqualTo(testFile);
             assertThat(capturingHandler.registeredKey).isNotNull();

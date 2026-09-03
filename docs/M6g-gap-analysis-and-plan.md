@@ -278,7 +278,7 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 
 ---
 
-### M6g-4 — JSON-RPC router, method dispatch, push events, error vocabulary
+### M6g-4 — JSON-RPC router, method dispatch, push events, error vocabulary ✅ (Verified)
 
 **Goal:** The original M6g scope — now actually buildable, because M6g-1 through M6g-3 provided everything it needs to call.
 
@@ -306,7 +306,14 @@ M6f ✅ ──→ M6g-1 ──→ M6g-2 ──→ M6g-3 ──→ M6g-4 ──�
 | `network.status` | Aggregated from `SessionManager.localPeerId()` + `PeerNetworkService.listenAddresses()` + `PeerRoutingTable` | `relayConnected` = `false` until M6h; `connectedPeerCount` = peers with `hasSession == true` — see §2.4 |
 | `network.connectedPeers` | `PeerRoutingTable` entries filtered by `hasSession == true` | Returns peer ID, display name, last seen timestamp — "connected" = established Signal session, not live TCP socket (§2.4) |
 
-**Verification:** Unit tests for JSON-RPC envelope parsing (valid requests, batch requests, malformed input). Unit tests for each method handler (mock backend, verify JSON response shape). Unit tests for error response formatting (every `DaemonErrorCode` mapped correctly). Unit tests for push event emission (mock WebSocket session, verify `event.*` frame content). Deferred to M6h: live end-to-end test with a real WebSocket client.
+**Verification:** Unit tests across `DaemonErrorCodeTest` (4/4), `JsonRpcRequestTest` (20/20), `JsonRpcResponseTest` (5/5), `RpcJsonMapperTest` (9/9), and `JsonRpcRouterTest` (29/29) — 39/39 Gradle tasks green repository-wide. Deferred to M6h: live end-to-end test with a real WebSocket client.
+
+**Amendment (as actually built):**
+- **Two real gaps found in `SessionManager` itself, not just missing router code.** `sendChatMessage`/`sendFile` generate `messageId`/`transferId` internally but never returned them — no way for `messages.send`/`files.send` to fulfill their own documented `{ messageId }`/`{ transferId }` response shapes. Fixed by changing both return types to small new records (`ChatSendResult`, `FileSendResult`) pairing the real id with the existing `ConnectivityStatus`. See README's M6g-4 section for the full reasoning, including why a router-generated id could not have substituted.
+- **Two testability constraints, not anticipated above.** `DaemonWebSocketServer` and `WebSocketSession` are both `final` with package-private constructors directly wrapping real Netty objects — neither can be constructed in a unit test. Worked around with `JsonRpcRouter.EventBroadcaster` (in place of a direct `DaemonWebSocketServer` dependency) and a package-private `JsonRpcRouter.handle(text)` (the actual dispatch logic, factored out of `onMessage` so tests never need a real `WebSocketSession`).
+- **`contentType` is rejected unless exactly `"text/plain"`**, rather than silently ignored — `SessionManager.sendChatMessage` hardcodes that value internally, confirmed by reading it directly. See the Feature Tracking Matrix below for this tracked as its own line.
+- **Event forwarding covers all five `DaemonEventListener` callbacks**, not just the three named as examples above — `onDeliveryStateChanged` → `event.message.deliveryStateChanged`, `onFileOfferReceived` → `event.file.offerReceived`, added alongside the three already named. This table predates M6g-3's finalized listener interface and could not have named callbacks that didn't exist yet; dropping either would leave a real, already-built capability with no way to reach a client.
+- **A real gap found while cross-checking this table against `SessionManager`'s actual public API**: `messages.markRead` was never in §7's real method table to begin with (confirmed by re-reading it directly — only 13 methods exist, none of them this), and there would have been no backend call site to wire it to regardless — `SessionManager` has no method to *send* a `ReadReceiptPayload`, only to *receive* one (`case ReadReceiptPayload read -> storage.markMessagesReadUpTo(...)`, inbound-only). Read receipts are one-directional in the current implementation: this daemon can process someone else's read receipt but has no way to generate its own. Not something this milestone's real scope (§7's actual 13 methods) could have closed — tracked below as a genuinely open gap, not a stale table entry.
 
 ---
 
@@ -316,27 +323,30 @@ Every planned feature, where it's tracked, and what milestone it belongs to. **N
 
 | Feature | Current Status | Target Milestone | Notes |
 |:---|:---|:---|:---|
-| 1:1 chat send/receive | ✅ Proven (M5c/M5d) | M6g-4 (API exposure) | Core mechanism done; needs RPC surface |
+| 1:1 chat send/receive | ✅ Complete | — | Proven on real hardware (M5c/M5d); exposed via `messages.send`/`messages.history` (M6g-4) |
 | Message dedup | ✅ Built (M5d/M6e-2) | — | Complete in `SessionManager` |
-| Delivery receipts | ✅ Built (M5d/M6e-2) | — | Complete, auto-sent by `SessionManager` |
-| Read receipts | ✅ Built (M5d/M6e-2) | M6g-4 (API exposure) | Mechanism complete; needs RPC trigger |
+| Delivery receipts | ✅ Built (M5d/M6e-2) | — | Complete, auto-sent by `SessionManager`; forwarded live via `event.message.deliveryStateChanged` (M6g-4) |
+| Read receipts (inbound processing) | ✅ Built (M5d/M6e-2) | — | `StorageService.markMessagesReadUpTo` — complete for processing an incoming receipt |
+| Read receipts (outbound trigger) | ❌ Not started | **M6h or M7** | No `SessionManager` method sends a `ReadReceiptPayload` at all — the earlier version of this row's "M6g-4 (API exposure)" target was wrong: §7 never defined a `messages.markRead` method to expose, and there was no backend call site regardless. See §3's M6g-4 amendment above |
 | HLC ordering | ✅ Built (M5a) | — | Complete |
-| File transfer (single-peer, chunked, encrypted) | ✅ Proven (M4a–M4d) | M6g-3 (handler integration) | Mechanism proven; needs `SessionManager` integration |
-| File transfer resume | ✅ Proven (M4d) | M6g-3 | |
-| File accept/reject flow | ❌ Not started | M6g-3 | Currently auto-accepts in demo Mains |
+| File transfer (single-peer, chunked, encrypted) | ✅ Built (M4a–M4d, integrated M6g-3) | — | Complete; live-wiring confirmed on real hardware via the post-M6g-3 checkpoint (README) |
+| File transfer resume | ✅ Proven (M4d) | — | |
+| File accept/reject flow | ✅ Built (M6g-3) | — | `TransferState.OFFERED`/`ACCEPTED` gate in `DefaultFileTransferHandler`; demo Mains now auto-accept via a real listener, not a hardcoded shortcut — see README M6g-3 checkpoint |
+| File-transfer completion receipt (sender-side ACK) | ❌ Not started | **M6h** | No wire payload exists for the sender to learn the receiver's hash-verification result, unlike chat's `DeliveryReceiptPayload`/`ReadReceiptPayload`. Named in M6g-3's own `outgoingTransfers` TTL-eviction rationale, then empirically confirmed live via the post-M6g-3 real-hardware checkpoint (both the 387 B and 512 KB runs' sender console stops after the last chunk-sent line — no completion event, because `DefaultFileTransferHandler` never calls `eventListener.onFileTransferProgress` from the sending side). Small and self-contained: one new `FileTransferReceiptPayload`, sent by the receiver on `COMPLETED`/`FAILED`, handled the same way `DeliveryReceiptPayload` already is |
+| Locally-detected send failure, pushed live | ❌ Not started | **M6h** | `messages.send`/`files.send` (M6g-4) report success at the RPC level even when the underlying `ConnectivityStatus` is `UNREACHABLE` — a real, already-persisted message/transfer exists either way, but no `event.*` notification tells a connected client a send failed in real time; the client only learns via a later `messages.history` poll. Found while building M6g-4's response-shape handling, not solved there — `SessionManager` itself would need a new event-emission call site |
 | File cancel | ❌ Not started | **M7** | Needs UI-driven interruption semantics |
 | Signed discovery records | ✅ Built (M6f) | — | Complete |
-| Pre-key bundle via discovery | ✅ Record format supports it (M6f) | M6g-2 (wired into `contacts.add`) | |
+| Pre-key bundle via discovery | ✅ Built (M6f, wired M6g-2) | — | Complete |
 | Pre-key bundle refresh cadence | ❌ Not started | **M6h** | Needs daemon loop to schedule; see README M6e-2 section |
 | Persistent Signal sessions | ✅ Built (M6e-1) | — | Complete (39/39 tests) |
 | Multi-peer SessionManager | ✅ Built (M6e-2) | — | Complete |
 | Relay-delivered inbound reception | ❌ Not wired | **M6h** | `SessionManager` registers `OnEnvelopeMessage` only, not `RelayEventHandler` |
-| JSON-RPC 2.0 over WebSocket | Transport ✅ (M6d), JSON ✅ (M6c) | M6g-4 (RPC layer) | |
-| Invite code mechanism | ❌ Designed here (§2.1) | M6g-2 | |
-| Peer routing / address book | ❌ Designed here (§2.3) | M6g-2 | |
-| StorageService read-side queries | ❌ Not started | M6g-1 | |
-| Event emission to frontend | ❌ Designed here (§2.5) | M6g-3 | |
-| `conversations.createGroup` | ❌ M8 scope | **M8** | CRDT membership + sender-key rotation |
+| JSON-RPC 2.0 over WebSocket | ✅ Built (transport M6d, JSON M6c, router M6g-4) | — | Sandbox-verified only — see README's M6g-4 section |
+| Invite code mechanism | ✅ Built (M6g-2) | — | |
+| Peer routing / address book | ✅ Built (M6g-2) | — | |
+| StorageService read-side queries | ✅ Built (M6g-1) | — | |
+| Event emission to frontend | ✅ Built (M6g-3, forwarded M6g-4) | — | All five `DaemonEventListener` callbacks now reach a client as `event.*` push notifications |
+| `conversations.createGroup` | ❌ M8 scope | **M8** | CRDT membership + sender-key rotation; `JsonRpcRouter` returns `METHOD_NOT_FOUND` with a descriptive message (M6g-4) |
 | Group chat CRDT membership | ❌ Not started | **M8** | OR-Set, `crdt_ops_log` table ready |
 | Sender-key group encryption | ❌ Not started | **M8** | §8's sender-key scheme |
 | Electron frontend | ❌ Not started | **M7** | |
@@ -353,8 +363,12 @@ Every planned feature, where it's tracked, and what milestone it belongs to. **N
 
 ## 5. Relationship to M6h
 
-M6h (`DaemonMain` composition root) is **unchanged in purpose** — it remains the final assembly step where every daemon component is wired together in one `main()`, with a Gradle task `:node-daemon:runDaemon`. What changes: it now has more pieces to wire (M6g-1 through M6g-3 add `PeerRoutingTable`, `ContactService`, `DaemonEventListener`, and `DefaultFileTransferHandler`), and it picks up the explicitly-deferred items from M6e-2 that require a live daemon loop:
+M6h (`DaemonMain` composition root) is **unchanged in purpose** — it remains the final assembly step where every daemon component is wired together in one `main()`, with a Gradle task `:node-daemon:runDaemon`. What changes: it now has more pieces to wire (M6g-1 through M6g-3 add `PeerRoutingTable`, `ContactService`, `DaemonEventListener`, and `DefaultFileTransferHandler`; M6g-4 adds `JsonRpcRouter` itself, plus a real `DaemonWebSocketServer` wired to it via `router.attachEventBroadcaster(server::broadcast)`), and it picks up the explicitly-deferred items from M6e-2 that require a live daemon loop:
 
+- **A real `./gradlew test` confirmation of M6g-4 itself, before anything else.** M6g-4 was built and sandbox-verified by compilation only (see README's M6g-4 section) — no real JDK/JUnit/AssertJ was reachable in the environment it was built in, so none of its new tests have actually been executed. The same real-hardware-checkpoint discipline M6g-3 already went through (see README) before M6g-4 started should happen for M6g-4 too, first, before M6h builds anything on top of it.
 - **Relay-delivered inbound reception**: wire `SessionManager` as a `RelayEventHandler`, not just `OnEnvelopeMessage`.
 - **Pre-key bundle refresh cadence**: schedule periodic republication of signed discovery records with fresh bundles.
-- **Automated E2E test**: two daemon processes exchange chat messages and file transfers via JSON-RPC, verifying the full stack end-to-end.
+- **File-transfer completion receipt**: a small `FileTransferReceiptPayload`, sent by the receiver once a transfer reaches `COMPLETED`/`FAILED`, handled on the sender's side the same way `DeliveryReceiptPayload` already is. Named as a gap in M6g-3's own rationale, then empirically confirmed via the post-M6g-3 real-hardware checkpoint (see README's M6g-3 section) — the sender genuinely has no way today to learn whether the receiver's hash check passed.
+- **Locally-detected send failure, pushed live**: `messages.send`/`files.send` (M6g-4) report RPC-level success even when the underlying send resolved `UNREACHABLE` — a real, deliberate choice (see §3's M6g-4 amendment above), but it means a connected client currently has no live signal that a send failed, only a later `messages.history` poll. Needs a new `SessionManager` event-emission call site, not just router-level work.
+- **Outbound read receipts**: `SessionManager` can process an inbound `ReadReceiptPayload` but has no method to send one — read receipts are entirely one-directional today. Found while cross-checking the Feature Tracking Matrix against `SessionManager`'s real API during M6g-4, not previously named.
+- **Automated E2E test**: two daemon processes exchange chat messages and file transfers via JSON-RPC, verifying the full stack end-to-end — now including `JsonRpcRouter`/`DaemonWebSocketServer` in that stack, not just `SessionManager` directly.

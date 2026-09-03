@@ -150,11 +150,11 @@ flowchart TD
 * **Scope note**: `files.cancel` deferred to M7.
 * **Verification**: 9/9 `DefaultFileTransferHandlerTest` scenarios, 9/9 `SessionManagerReceivePipelineTest` cases, and 18/18 `SqliteStorageServiceTest` cases (39/39 tasks green repository-wide).
 
-##### M6g-4 — JSON-RPC Router, Method Dispatch, Push Events, Error Vocabulary
+##### M6g-4 — JSON-RPC Router, Method Dispatch, Push Events, Error Vocabulary ✅ (Verified)
 * **Goal**: The original M6g scope — now buildable because M6g-1 through M6g-3 provided everything it needs.
 * **New code**: `JsonRpcRequest`/`JsonRpcResponse`/`JsonRpcError` records (on top of M6c's `JsonValue`/`JsonCodec`). `DaemonErrorCode` enum (`PEER_UNREACHABLE`, `RELAY_UNAVAILABLE`, `MALFORMED_RECORD`, `CRYPTO_FAILURE`, `DUPLICATE_MESSAGE`, `STORAGE_FAILURE`, `INVALID_REQUEST`, `METHOD_NOT_FOUND`, `UNKNOWN_CONVERSATION`, `UNKNOWN_CONTACT`). `JsonRpcRouter` implements both `WebSocketTextHandler` (request dispatch) and `DaemonEventListener` (push event emission via `DaemonWebSocketServer.broadcast`).
 * **Method names**: §7's original namespace (`messages.send`, `messages.history`, etc.), not the M6-roadmap's earlier alternatives. `conversations.createGroup` returns `METHOD_NOT_FOUND` ("available in a future version") until M8. `files.cancel` returns `METHOD_NOT_FOUND` until M7.
-* **Verification**: Unit tests for JSON-RPC envelope parsing, each method handler (mock backend), error formatting, and push event content.
+* **Verification**: Unit tests across `DaemonErrorCodeTest` (4/4), `JsonRpcRequestTest` (20/20), `JsonRpcResponseTest` (5/5), `RpcJsonMapperTest` (9/9), and `JsonRpcRouterTest` (29/29) — 39/39 Gradle tasks green repository-wide.
 
 #### **M6h — `DaemonMain` Composition Root & Automated E2E Test**
 * **Goal**: Assemble the complete daemon process and Gradle task `:node-daemon:runDaemon`.
