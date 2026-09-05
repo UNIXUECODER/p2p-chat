@@ -6,7 +6,11 @@ import com.p2pchat.storage.model.Message;
 import com.p2pchat.storage.model.TransferState;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Locale;
+import java.util.Set;
+import java.util.regex.Pattern;
 
 /**
  * M6g-3 checkpoint: a minimal, real (not test-fake) {@link DaemonEventListener} — prints every
@@ -76,7 +80,7 @@ public final class PrintingDaemonEventListener implements DaemonEventListener {
             System.err.println("[event] cannot auto-accept " + transferId + " -- SessionManager not yet attached");
             return;
         }
-        Path savePath = downloadDir.resolve(transferId + "-" + sanitizeFileName(fileName));
+        Path savePath = resolveSafeSavePath(transferId, fileName);
         manager.acceptFileTransfer(transferId, savePath);
         System.out.println("[event] accepted " + transferId + ", saving to " + savePath.toAbsolutePath());
     }
@@ -92,10 +96,112 @@ public final class PrintingDaemonEventListener implements DaemonEventListener {
         System.out.println("[event] network.statusChanged (a session transitioned from not-existing to existing)");
     }
 
-    // Defends only against path separators making it into a filename via a peer-supplied
-    // FileOfferPayload.fileName -- not a full sanitizer, just enough that this checkpoint's own
-    // downloadDir.resolve(...) call can't be walked outside downloadDir by a crafted offer.
-    private static String sanitizeFileName(String fileName) {
-        return fileName.replace("/", "_").replace("\\", "_");
+    // Everything below is pre-m6h-hardening-plan.md finding C-4. The previous version only
+    // replaced "/" and "\\" in fileName, which was flagged as fragile-by-construction: a denylist
+    // guarding a resolve() call breaks the moment any caller uses it differently, or a new
+    // traversal trick surfaces. Reviewing it for this fix also turned up a second input the old
+    // version never touched at all — transferId, which is just as wire-supplied and attacker-
+    // controlled as fileName (see FileOfferPayload/FileTransferMessageCodec — decoded as a plain
+    // string, never validated as the UUID format the sending side happens to generate), and was
+    // being concatenated into the same path unsanitized. An allowlist on fileName alone would
+    // have left that path open. The fix below is allowlist-plus-containment-assertion on the
+    // *resolved path as a whole*, specifically because that closes both inputs at once rather
+    // than requiring a matching fix be remembered for every field that ever ends up in a path.
+
+    private static final int MAX_SAFE_NAME_LENGTH = 150;
+    // Parentheses are allowed deliberately, not just permissively: dedupe() below generates
+    // "name (2).ext" itself, so excluding "(" ")" from user-supplied names while the collision
+    // suffix uses them would be an inconsistency, not extra safety — a name with real parens
+    // (e.g. a peer sending "final (draft).pdf") would otherwise be mangled for no security benefit.
+    private static final Pattern UNSAFE_CHARACTERS = Pattern.compile("[^A-Za-z0-9._ ()-]");
+    private static final Set<String> WINDOWS_RESERVED_NAMES = Set.of(
+            "CON", "PRN", "AUX", "NUL",
+            "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+            "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9");
+
+    /**
+     * Turns a peer-supplied {@code transferId} and {@code fileName} into a path that is
+     * guaranteed to resolve inside {@link #downloadDir}, guaranteed not to collide with an
+     * existing file, and safe on both POSIX and Windows filesystems.
+     *
+     * <p>Three layers, deliberately not relying on any single one alone:
+     * <ol>
+     *   <li><b>Allowlist</b> each candidate component down to {@code [A-Za-z0-9._ -]}, strip
+     *       leading dots (so a component can't become {@code "."}, {@code ".."}, or a hidden
+     *       file), cap length, and reject Windows-reserved device names — case-insensitively,
+     *       and against the base name before any extension, since Windows treats
+     *       {@code "CON.txt"} as reserved too, not just bare {@code "CON"}.</li>
+     *   <li><b>Containment assertion after resolution</b>: the allowlist above is defence in
+     *       depth, not the load-bearing check. The load-bearing check is that
+     *       {@code resolved.normalize()} must still start with {@code downloadDir.normalize()} —
+     *       this is what actually stops a traversal, independent of which input caused it or
+     *       whether the allowlist has a gap nobody's found yet.</li>
+     *   <li><b>Collision handling</b>: if the resolved path already exists, append
+     *       {@code " (2)"}, {@code " (3)"}, ... before the extension rather than silently
+     *       overwriting a previous download — relevant even with {@code transferId} prefixed,
+     *       since transferId is peer-supplied and nothing stops a peer (malicious or just
+     *       retrying) from reusing one.</li>
+     * </ol>
+     */
+    // Package-private, not private: lets PrintingDaemonEventListenerTest exercise the path-safety
+    // logic directly, against a real @TempDir, without needing to stand up a full SessionManager
+    // (a heavy, many-dependency construction this class only needs for the one live call this
+    // method's caller makes) just to reach code that has nothing to do with SessionManager at all.
+    Path resolveSafeSavePath(String transferId, String fileName) {
+        Path normalizedDownloadDir = downloadDir.toAbsolutePath().normalize();
+        String candidateBase = allowlistedComponent(transferId) + "-" + allowlistedComponent(fileName);
+
+        Path resolved = normalizedDownloadDir.resolve(candidateBase).normalize();
+        if (!resolved.startsWith(normalizedDownloadDir)) {
+            // Should be unreachable given the allowlist above (it strips "/", "\\", and leading
+            // dots, so no candidate can produce ".." or an absolute path) — kept anyway as the
+            // real defence per this method's Javadoc, not just a sanity check.
+            throw new SecurityException(
+                    "Refusing to save file outside download directory: transferId=" + transferId + " fileName=" + fileName);
+        }
+
+        return dedupe(resolved, normalizedDownloadDir);
+    }
+
+    /** Applies the allowlist/length-cap/reserved-name rules to a single path component. */
+    static String allowlistedComponent(String raw) {
+        String cleaned = UNSAFE_CHARACTERS.matcher(raw == null ? "" : raw).replaceAll("_");
+        while (cleaned.startsWith(".")) {
+            cleaned = cleaned.substring(1);
+        }
+        if (cleaned.isBlank()) {
+            cleaned = "unnamed";
+        }
+        if (cleaned.length() > MAX_SAFE_NAME_LENGTH) {
+            cleaned = cleaned.substring(0, MAX_SAFE_NAME_LENGTH);
+        }
+
+        String baseName = cleaned.contains(".") ? cleaned.substring(0, cleaned.indexOf('.')) : cleaned;
+        if (WINDOWS_RESERVED_NAMES.contains(baseName.toUpperCase(Locale.ROOT))) {
+            cleaned = "_" + cleaned;
+        }
+        return cleaned;
+    }
+
+    /** If {@code path} already exists, finds the first "name (n).ext" that doesn't. */
+    private static Path dedupe(Path path, Path normalizedDownloadDir) {
+        if (!Files.exists(path)) {
+            return path;
+        }
+        String fullName = path.getFileName().toString();
+        int dot = fullName.lastIndexOf('.');
+        String stem = dot > 0 ? fullName.substring(0, dot) : fullName;
+        String extension = dot > 0 ? fullName.substring(dot) : "";
+
+        for (int suffix = 2; suffix < 10_000; suffix++) {
+            Path candidate = normalizedDownloadDir.resolve(stem + " (" + suffix + ")" + extension);
+            if (!Files.exists(candidate)) {
+                return candidate;
+            }
+        }
+        // Practically unreachable (would mean 10,000 same-named collisions in one directory) —
+        // fail loudly rather than silently overwrite, which is the one thing this method exists
+        // to prevent.
+        throw new IllegalStateException("Could not find a free filename for " + fullName + " in " + normalizedDownloadDir);
     }
 }

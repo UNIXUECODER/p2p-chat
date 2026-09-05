@@ -156,6 +156,18 @@ flowchart TD
 * **Method names**: §7's original namespace (`messages.send`, `messages.history`, etc.), not the M6-roadmap's earlier alternatives. `conversations.createGroup` returns `METHOD_NOT_FOUND` ("available in a future version") until M8. `files.cancel` returns `METHOD_NOT_FOUND` until M7.
 * **Verification**: Unit tests across `DaemonErrorCodeTest` (4/4), `JsonRpcRequestTest` (20/20), `JsonRpcResponseTest` (5/5), `RpcJsonMapperTest` (9/9), and `JsonRpcRouterTest` (29/29) — 39/39 Gradle tasks green repository-wide.
 
+##### M6g-5 — Pre-M6h Hardening Pass 🧪 Tested (local run)
+* **Goal**: Close the 4 critical (🔴) security and hygiene findings from the peer audit (`docs/pre-m6h-hardening-plan.md`) ahead of M6h.
+* **New code & fixes**:
+  * **D-1**: Added verbatim AGPL-3.0 `LICENSE`.
+  * **D-2**: Updated `.github/workflows/ci.yml` (all branches/PRs) and added `jacoco` per-subproject reporting in `build.gradle.kts`.
+  * **D-3**: Created `docs/verification-vocabulary.md` defining badges (✅, 🧪, 🔨, ✍️) and resolved cross-document verification status contradictions.
+  * **C-1**: Secured WebSocket daemon — loopback `127.0.0.1` bind, Netty `checkStartsWith` query parsing, `HandshakeAuthHandler` with Origin checking and constant-time token comparison, and `RpcAuthToken` generating 256-bit hex tokens (`rw-------`).
+  * **C-2**: Atomic owner-only file permissions (`0600`) at creation time for identity keys, Signal key vaults, and SQLite database.
+  * **C-3**: Bounded wire-supplied `FileOfferPayload` sizes (chunk size 1 KiB–8 MiB, chunk count consistency check, max file size cap), and chunk seek/plaintext length checks in `DefaultFileTransferHandler`.
+  * **C-4**: Hardened filename and transferId sanitization in `PrintingDaemonEventListener` with allowlist, Windows reserved name protection, and normalized path containment assertions.
+* **Verification**: 368/368 automated unit tests passing across all 8 modules and 49 Gradle tasks repository-wide, with JaCoCo reports generated.
+
 #### **M6h — `DaemonMain` Composition Root & Automated E2E Test**
 * **Goal**: Assemble the complete daemon process and Gradle task `:node-daemon:runDaemon`.
 * **Logic**: Wire `DaemonWebSocketServer` + `JsonRpcRouter` + `SessionManager` + `OutboundMessageService` + `SqliteStorageService` + `Libp2pNetworkService` + `PeerRoutingTable` + `ContactService` + `DefaultFileTransferHandler` + `DaemonEventListener` in `DaemonMain`. Also picks up the deferred items from M6e-2 that require a live daemon loop: relay-delivered inbound reception (wire `SessionManager` as `RelayEventHandler`), pre-key bundle refresh cadence (scheduled republication of signed discovery records), and the automated E2E integration test (two daemon processes exchange chat messages and file transfers via JSON-RPC).

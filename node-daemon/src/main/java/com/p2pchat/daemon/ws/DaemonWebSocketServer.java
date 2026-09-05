@@ -12,8 +12,11 @@ import io.netty.handler.codec.http.HttpObjectAggregator;
 import io.netty.handler.codec.http.HttpServerCodec;
 import io.netty.handler.codec.http.websocketx.WebSocketServerProtocolHandler;
 
+import java.io.IOException;
+import java.nio.file.Path;
 import java.util.Collection;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -51,6 +54,17 @@ import java.util.concurrent.ConcurrentHashMap;
  * jvm-libp2p} manages internally for {@code PeerNetworkService} — this class never touches that,
  * and {@code PeerNetworkService} exposes no hook to share one even if it seemed appealing to.
  * Two independent Netty-based subsystems in one process, not one shared implicitly.
+ *
+ * <p><b>pre-m6h-hardening-plan.md finding C-1</b> — three changes, all here: binds to loopback
+ * only (not every interface, which is what a bare {@code bind(port)} does), requires an {@link
+ * HandshakeAuthHandler} check (Origin allowlist + token) on every connection attempt before
+ * {@code WebSocketServerProtocolHandler} ever sees it, and generates the required token itself
+ * in the convenience constructor via {@link RpcAuthToken} — see that class's own Javadoc for why
+ * it's regenerated fresh per daemon start rather than persisted long-term. The token file's path
+ * is a constructor parameter, not hardcoded to the audit's own suggested {@code ~/.p2p-chat} —
+ * this project's actual established convention (see every existing {@code *Main} class in this
+ * module) is a {@code p2pchat.dataDir}-relative directory, decided by whatever constructs this
+ * class, not assumed here. M6h's {@code DaemonMain} is what will make that real decision.
  */
 public final class DaemonWebSocketServer implements AutoCloseable {
 
@@ -59,15 +73,30 @@ public final class DaemonWebSocketServer implements AutoCloseable {
 
     private final String path;
     private final WebSocketTextHandler textHandler;
+    private final Set<String> allowedOrigins;
+    private final String requiredToken;
     private final Map<String, WebSocketSession> sessions = new ConcurrentHashMap<>();
 
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private Channel serverChannel;
 
-    public DaemonWebSocketServer(String path, WebSocketTextHandler textHandler) {
+    /**
+     * Generates a fresh token itself (see {@link RpcAuthToken}), persisted to {@code tokenFile},
+     * and starts with an empty Origin allowlist — meaning no {@code Origin} header value is
+     * accepted at all, the correct default until M7's Electron app exists and its real origin is
+     * known (see {@link HandshakeAuthHandler}'s own Javadoc on what an empty set means).
+     */
+    public DaemonWebSocketServer(String path, WebSocketTextHandler textHandler, Path tokenFile) throws IOException {
+        this(path, textHandler, Set.of(), RpcAuthToken.generateAndPersist(tokenFile));
+    }
+
+    public DaemonWebSocketServer(String path, WebSocketTextHandler textHandler, Set<String> allowedOrigins,
+                                  String requiredToken) {
         this.path = path;
         this.textHandler = textHandler;
+        this.allowedOrigins = allowedOrigins;
+        this.requiredToken = requiredToken;
     }
 
     /**
@@ -79,6 +108,7 @@ public final class DaemonWebSocketServer implements AutoCloseable {
         bossGroup = new NioEventLoopGroup(1);
         workerGroup = new NioEventLoopGroup();
         DaemonWebSocketFrameHandler frameHandler = new DaemonWebSocketFrameHandler(textHandler, sessions);
+        HandshakeAuthHandler authHandler = new HandshakeAuthHandler(allowedOrigins, requiredToken);
 
         ServerBootstrap bootstrap = new ServerBootstrap();
         bootstrap.group(bossGroup, workerGroup)
@@ -89,12 +119,21 @@ public final class DaemonWebSocketServer implements AutoCloseable {
                         ChannelPipeline pipeline = channel.pipeline();
                         pipeline.addLast(new HttpServerCodec());
                         pipeline.addLast(new HttpObjectAggregator(MAX_HTTP_CONTENT_LENGTH));
-                        pipeline.addLast(new WebSocketServerProtocolHandler(path, null, false, MAX_FRAME_SIZE));
+                        pipeline.addLast(authHandler);
+                        // checkStartsWith=true (the 5th boolean here, after allowExtensions=false
+                        // and maxFrameSize) -- required so a URI of "/v1?token=..." still matches
+                        // the configured "/v1" path. See HandshakeAuthHandler's own Javadoc for
+                        // why this isn't optional once a token lives in the query string.
+                        pipeline.addLast(new WebSocketServerProtocolHandler(path, null, false, MAX_FRAME_SIZE, false, true));
                         pipeline.addLast(frameHandler);
                     }
                 });
 
-        serverChannel = bootstrap.bind(port).sync().channel();
+        // Bound to loopback explicitly -- a bare bind(port) binds every interface (0.0.0.0),
+        // meaning any device on the same LAN (or, if the host's own firewall doesn't block it,
+        // in principle anything routing to it) could reach the JSON-RPC API. See this class's
+        // own Javadoc reference to the hardening audit.
+        serverChannel = bootstrap.bind("127.0.0.1", port).sync().channel();
     }
 
     /** Pushes {@code text} to every currently connected client — what M6g's {@code event.*} push events will use. */

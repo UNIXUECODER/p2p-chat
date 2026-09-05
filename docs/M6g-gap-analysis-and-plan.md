@@ -7,6 +7,15 @@
 > exist yet. Rather than building those prerequisites inside M6g itself — turning one milestone
 > into four — this document captures the gaps, resolves the design decisions they surface, and
 > splits M6g into sub-milestones following the same M6e-1/M6e-2 pattern already established.
+>
+> **Status as of M6g-5:** M6g-1 through M6g-4 (below) are done — see the README's own status
+> table and per-milestone sections, which are the current source of truth for what's actually
+> built and verified; this document's §5 log predates some of that and isn't kept in lockstep
+> with it (see the struck-through, dated correction in §5 for a worked example of exactly that
+> drift, found and fixed by the pre-M6h hardening audit's finding D-3). M6g-5 — a hardening pass
+> responding to that same audit — is also done; see `docs/pre-m6h-hardening-plan.md` and the
+> README's own M6g-5 section, not a new section here. M6h (`DaemonMain`) remains, now preceded by
+> that audit's own Tracks A/B.
 
 ---
 
@@ -365,7 +374,7 @@ Every planned feature, where it's tracked, and what milestone it belongs to. **N
 
 M6h (`DaemonMain` composition root) is **unchanged in purpose** — it remains the final assembly step where every daemon component is wired together in one `main()`, with a Gradle task `:node-daemon:runDaemon`. What changes: it now has more pieces to wire (M6g-1 through M6g-3 add `PeerRoutingTable`, `ContactService`, `DaemonEventListener`, and `DefaultFileTransferHandler`; M6g-4 adds `JsonRpcRouter` itself, plus a real `DaemonWebSocketServer` wired to it via `router.attachEventBroadcaster(server::broadcast)`), and it picks up the explicitly-deferred items from M6e-2 that require a live daemon loop:
 
-- **A real `./gradlew test` confirmation of M6g-4 itself, before anything else.** M6g-4 was built and sandbox-verified by compilation only (see README's M6g-4 section) — no real JDK/JUnit/AssertJ was reachable in the environment it was built in, so none of its new tests have actually been executed. The same real-hardware-checkpoint discipline M6g-3 already went through (see README) before M6g-4 started should happen for M6g-4 too, first, before M6h builds anything on top of it.
+- ~~A real `./gradlew test` confirmation of M6g-4 itself, before anything else.~~ **Resolved — this line was stale.** It claimed M6g-4 was sandbox-verified by compilation only, contradicting the README's M6g-4 section ("39/39 Gradle tasks green repository-wide"). The pre-M6h hardening audit (see `docs/pre-m6h-hardening-plan.md`, finding D-3) flagged the contradiction directly; it is resolved in the README's favor, confirmed against the actual on-disk JUnit XML output from that run (not just re-asserting the prose claim) — `TEST-com.p2pchat.daemon.rpc.JsonRpcRouterTest.xml` etc. show 29/29, 20/20, 5/5, 4/4, 9/9 respectively, all `failures="0" errors="0"`, i.e. a real executed run, not a compile-only pass. This line is left here, struck through, so the correction is visible rather than silently deleted — see D-3's own recommendation against letting verification status drift undetected across documents.
 - **Relay-delivered inbound reception**: wire `SessionManager` as a `RelayEventHandler`, not just `OnEnvelopeMessage`.
 - **Pre-key bundle refresh cadence**: schedule periodic republication of signed discovery records with fresh bundles.
 - **File-transfer completion receipt**: a small `FileTransferReceiptPayload`, sent by the receiver once a transfer reaches `COMPLETED`/`FAILED`, handled on the sender's side the same way `DeliveryReceiptPayload` already is. Named as a gap in M6g-3's own rationale, then empirically confirmed via the post-M6g-3 real-hardware checkpoint (see README's M6g-3 section) — the sender genuinely has no way today to learn whether the receiver's hash check passed.

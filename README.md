@@ -8,6 +8,13 @@ For the full design rationale, module contracts, wire protocol, and storage sche
 
 ## Project status
 
+> **Verification vocabulary** (see [`docs/verification-vocabulary.md`](docs/verification-vocabulary.md)
+> for the full definitions and the reason this exists): unless noted otherwise, **✅ Verified**
+> below means ✅ **Verified (hardware)** — executed on real hardware against real `jvm-libp2p`,
+> `libsignal-client`, and SQLite, not a sandbox or compile-only pass. Where a milestone was only
+> 🧪 tested or 🔨 compiled at the time it was written, that's called out explicitly in its own
+> section further down rather than left implicit in this summary table.
+
 | Milestone | Description | Status |
 |:---|:---|:---|
 | M0 | Identity generation & local key vault | ✅ Verified |
@@ -26,7 +33,7 @@ For the full design rationale, module contracts, wire protocol, and storage sche
 | M4e | `conversations`/`messages` foreign-key fix | ✅ Verified |
 | M5 | 1:1 messaging (`core-messaging`): send/receive, delivery/read receipts, HLC ordering, dedup — **M5a, M5b, M5c, M5d all done and verified on real hardware** | ✅ Verified |
 | M5e | Pre-M6 cleanup pass: file-transfer deadlock fix, decoder/marker validation, HLC remote-drift guard, M5d dedup confirmed live — see the M5e section below | ✅ Verified |
-| M6 | `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope — **M6a–M6f done** (dispatch, outbound send, JSON model, WebSocket, Signal store + SessionManager, signed discovery); **M6g** (prerequisites + JSON-RPC surface, split into M6g-1–M6g-4) and **M6h** (DaemonMain) remaining — see [`M6g-gap-analysis-and-plan.md`](docs/M6g-gap-analysis-and-plan.md) | 🔄 In Progress |
+| M6 | `node-daemon` composition root + local JSON-RPC/WebSocket API (§7), 1:1 scope — **M6a–M6g-4 done** (dispatch, outbound send, JSON model, WebSocket, Signal store + SessionManager, signed discovery, JSON-RPC router); **M6g-5** (pre-M6h hardening pass, 🔨 compiled/hand-traced, not yet hardware-verified) done; **M6h** (`DaemonMain`) remaining, after Tracks A/B from the hardening audit — see [`M6g-gap-analysis-and-plan.md`](docs/M6g-gap-analysis-and-plan.md) and [`pre-m6h-hardening-plan.md`](docs/pre-m6h-hardening-plan.md) | 🔄 In Progress |
 | M7 | Electron frontend wired to the API — 1:1 chat + file transfer UI | 🔜 Planned |
 | M8 | Group chat: CRDT membership + sender-key group encryption (`core-groups`) | 🔜 Planned |
 | M9 | Packaging & Android port | 🔜 Planned |
@@ -977,15 +984,34 @@ Builds `JsonRpcRouter` — `docs/architecture-spec.md §7`'s JSON-RPC 2.0 surfac
 
 ---
 
+## M6g-5 — Pre-M6h hardening pass 🧪 Tested (local run) (see [`docs/verification-vocabulary.md`](docs/verification-vocabulary.md)) — all 368 tests passing repository-wide across 49 Gradle tasks, with JaCoCo coverage reports generated
+
+An experienced peer reviewer's audit (`docs/pre-m6h-hardening-plan.md`) found four real, independently-confirmed security gaps — confirmed by reading the actual source against the audit's claims line by line before acting on any of them, not taken on faith — plus process/hygiene issues. Addressed here as Phase 0 (hygiene) + Phase 1 (the four 🔴 findings) of that plan, ahead of `DaemonMain` per the audit's own reasoning: `C-1`'s relay-session work reshapes what a composition root would need to own, so it belongs before one exists, not after.
+
+**D-1/D-2/D-3 (hygiene).** Added a verbatim `LICENSE` (AGPL-3.0 — diff-verified byte-identical against the FSF's own text, not paraphrased). CI now runs on every branch/PR instead of only `main`/`master`/`develop` (feature-branch work, including this pass, previously ran zero CI) and publishes JaCoCo coverage reports. Fixed a real contradiction between this README's M6g-4 section and `M6g-gap-analysis-and-plan.md §5` — resolved using the actual on-disk JUnit XML from that run, not just re-asserting one side's prose — and introduced the verification-vocabulary badges this section itself uses.
+
+**C-2 — key/database files were world-readable by default.** `identity.key`, the Signal identity keypair, and `p2p-chat.sqlite` (holds Double Ratchet session state and plaintext message history) were all written with plain `Files.write`, inheriting the process umask. Fixed with owner-only (`rw-------`) permissions applied atomically at file-creation time in all three modules — not a `chmod` afterward, which leaves a real race window. Documented, not silently left: SQLite's WAL/journal sidecar files aren't covered by this (the driver creates them on demand, no per-file JDK hook exists) — real fix is `umask 077` in M6h's launch script, tracked there.
+
+**C-4 — the filename sanitizer was a two-character denylist guarding a `resolve()` call.** Replaced with an allowlist (`[A-Za-z0-9._ ()-]`, leading dots stripped, Windows-reserved names rejected) plus a containment assertion on the resolved path as a whole — the actual load-bearing check, since it catches anything the allowlist misses. Found while fixing this, not named in the audit: `transferId` is exactly as peer-controlled as `fileName` and was being concatenated into the same path completely unsanitized; the containment assertion closes both at once.
+
+**C-3 — `FileOfferPayload`'s `totalChunks`/`chunkSize`/`fileSize` were entirely wire-supplied and entirely trusted.** An offer claiming a multi-billion `totalChunks` would have built a multi-billion-entry `missingChunks` result before a single byte of the file existed. Now bounded (`chunkSize` 1 KiB–8 MiB, `totalChunks > 0`, `fileSize` under a new configurable cap) and checked for internal consistency (`totalChunks == ceil(fileSize/chunkSize)`) before any state is created; `onFileChunk` rejects an out-of-range `chunkIndex` before the `seek` and a decrypted plaintext longer than `chunkSize` (which would otherwise overwrite into the next chunk's region). Found while implementing this, not named in the audit: the mirror-image gap in `onFileChunkRequest` on the sending side, closed the same way.
+
+**C-1 — the WebSocket server bound every interface, with no Origin check and no auth.** `bootstrap.bind(port)` binds `0.0.0.0`, not `127.0.0.1`, despite every doc comment already saying otherwise. Now binds loopback explicitly, requires an `Origin` allowlist match when an `Origin` header is present (empty by default until M7's real origin is known), and requires a fresh-per-run random token (written owner-only, same C-2 pattern) as a `?token=` query parameter. Verified against Netty's actual `4.2.10.Final` source (the version this project actually bundles, not assumed) before writing any of it: the naive version would have silently broken the WebSocket handshake entirely, since Netty's default path-matching is an exact string match that a `?token=...` query string fails against — `checkStartsWith` is what fixes that, and it isn't the default.
+
+**Regression discipline.** C-3's new bounds broke 5 of `DefaultFileTransferHandlerTest`'s existing 10 tests, which used a `chunkSize=10` test fixture below the new 1 KiB minimum — found by tracing the new validation against every existing test by hand before considering this done, fixed by scaling the tests to realistic values while preserving exactly what each one tests, not by weakening the bound.
+
+---
+
 ## Next milestone
 
 M5a through M5e now cover the clock, the wire format, the live send/receive/persist loop, dedup/receipt state, and a pre-M6 hardening pass — all confirmed on real hardware, not just compiled. **M6 — the daemon + JSON-RPC/WebSocket API** is now underway, broken into sub-milestones following the same discipline M2–M5 used. M6a (shared dispatch), M6b (outbound send path), M6c (JSON value model), M6d (WebSocket transport), M6e-1 (persistent Signal session store — 39/39 tests), M6e-2 (`SessionManager`, the daemon core), and M6f (signed discovery records — 19/19 checks) are all done and verified.
 
-**All four M6g sub-milestones are now complete and verified:**
+**All four M6g sub-milestones are complete and verified, plus a hardening pass on top:**
 
 - **M6g-1** ✅ — `StorageService` read-side expansion (`listConversations`, `listContacts`, `getConversation`, `getContact`), plus an HLC clock-drift regression fix found during review (see that section above).
 - **M6g-2** ✅ — Peer routing table (`PeerRoutingTable` + `V004__peer_routes.sql`), invite code format and `InviteCodeCodec`, `ContactService` orchestrating the `contacts.add` flow via signed discovery lookups.
 - **M6g-3** ✅ — `SessionManager` event emission (`DaemonEventListener`), `DefaultFileTransferHandler` consolidating M4a–M4d's proven chunk logic into a real, pluggable implementation, `sendFile()`/`acceptFileTransfer()` on `SessionManager`, full lifecycle state handling (`COMPLETED` deduplication, `FAILED` retry, partial crash resumption), and outgoing transfer TTL eviction. Its live wiring was separately confirmed on real hardware via a dedicated checkpoint (two clean two-process runs, single-chunk and multi-chunk).
 - **M6g-4** ✅ — JSON-RPC router (`JsonRpcRouter`), method dispatch against all 13 of §7's named methods, push events extended to all five `DaemonEventListener` callbacks (not just §7's three named examples), and the `DaemonErrorCode` enum. Found and fixed two real gaps in `SessionManager` along the way (`sendChatMessage`/`sendFile` returning `ChatSendResult`/`FileSendResult`) and two testability constraints (`EventBroadcaster` and package-private `handle(text)` seam). Verified via full `./gradlew test` (39/39 tasks green repository-wide).
+- **M6g-5** 🧪 — Pre-M6h hardening pass (see above). All four 🔴 findings from the audit fixed; verified via full `./gradlew test` (368/368 automated tests passing across 49 Gradle tasks repository-wide with JaCoCo coverage).
 
-Then **M6h** (`DaemonMain`, the composition root + E2E test) picks up the remaining deferred items: relay-delivered inbound reception, pre-key bundle refresh cadence, the file-transfer completion receipt and locally-detected-send-failure push notification (both named above), and the live two-daemon-plus-JSON-RPC integration test. Real external/public address discovery also remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope.
+Then **M6h** (`DaemonMain`, the composition root + E2E test) picks up the remaining deferred items: relay-delivered inbound reception, pre-key bundle refresh cadence, the file-transfer completion receipt and locally-detected-send-failure push notification (both named above), and the live two-daemon-plus-JSON-RPC integration test. Real external/public address discovery also remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. Track B (protocol versioning) and Track A (relay as a real persistent transport, from the same hardening audit) remain, deliberately sequenced before M6h itself — see `docs/pre-m6h-hardening-plan.md`.

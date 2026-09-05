@@ -1,5 +1,6 @@
 package com.p2pchat.daemon.session;
 
+import com.p2pchat.filetransfer.ChunkCipher;
 import com.p2pchat.filetransfer.FileChunker;
 import com.p2pchat.filetransfer.FileKey;
 import com.p2pchat.filetransfer.wire.FileChunkPayload;
@@ -70,15 +71,21 @@ class DefaultFileTransferHandlerTest {
 
     @Test
     void multiChunkFileWithShortLastChunkReassemblesExactly(@TempDir Path tempDir) throws Exception {
-        Harness h = new Harness(tempDir, 10); // tiny chunk size forces many chunks, and a short last one
-        Path sourceFile = h.writeRandomFile("bigger.bin", 137); // not a multiple of 10
+        // chunkSize is FileChunker.MIN_CHUNK_SIZE_BYTES, not an arbitrarily tiny test value -- see
+        // pre-m6h-hardening-plan.md finding C-3: DefaultFileTransferHandler now rejects any offer
+        // below that bound, so this (and the other Harness(tempDir, 10) tests below) moved up from
+        // a tiny hardcoded chunk size to the real minimum, scaling file sizes to preserve each
+        // test's actual point (here: multiple chunks, with a genuinely short last one) rather than
+        // just its literal old numbers.
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("bigger.bin", 3209); // 3 full 1024-byte chunks + a 137-byte short one
         Path saveFile = h.receiverDir.resolve("received.bin");
 
         String transferId = h.offer(sourceFile);
         h.receiverHandler.acceptFileTransfer(transferId, saveFile);
 
-        int totalChunks = FileChunker.chunkCount(137, 10);
-        assertThat(totalChunks).isEqualTo(14); // 13 full chunks + 1 short one
+        int totalChunks = FileChunker.chunkCount(3209, 1024);
+        assertThat(totalChunks).isEqualTo(4); // 3 full chunks + 1 short one (137 bytes)
         assertThat(h.receiverStorage.missingChunks(transferId, totalChunks)).isEmpty();
         assertThat(Files.readAllBytes(saveFile)).isEqualTo(Files.readAllBytes(sourceFile));
     }
@@ -102,8 +109,12 @@ class DefaultFileTransferHandlerTest {
 
     @Test
     void resumeAfterSimulatedRestartRequestsOnlyGenuinelyMissingChunks(@TempDir Path tempDir) throws Exception {
-        Harness h = new Harness(tempDir, 10);
-        Path sourceFile = h.writeRandomFile("resumable.bin", 55); // 6 chunks: indices 0..5
+        // See multiChunkFileWithShortLastChunkReassemblesExactly's comment on why this moved from
+        // chunkSize=10 to FileChunker.MIN_CHUNK_SIZE_BYTES. 6144 = 6 * 1024 -- an exact multiple,
+        // deliberately (this test is about resume/restart behavior by chunk index, not about
+        // short-last-chunk handling, which the other test already covers).
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("resumable.bin", 6144); // 6 chunks: indices 0..5
         Path saveFile = h.receiverDir.resolve("received.bin");
 
         // First attempt: simulate an interruption where only the first 3 chunks (0, 1, 2) arrive before crash
@@ -152,7 +163,10 @@ class DefaultFileTransferHandlerTest {
 
     @Test
     void duplicateOfferAfterAcceptDoesNotResetOrCorruptAnAlreadyCompletedTransfer(@TempDir Path tempDir) throws Exception {
-        Harness h = new Harness(tempDir, 10);
+        // See multiChunkFileWithShortLastChunkReassemblesExactly's comment on why this moved from
+        // chunkSize=10. This test's point is offer-deduplication after accept, not chunk count, so
+        // a single chunk (55 bytes < 1024) is fine here.
+        Harness h = new Harness(tempDir, 1024);
         Path sourceFile = h.writeRandomFile("retry.bin", 55);
         Path saveFile = h.receiverDir.resolve("received.bin");
 
@@ -199,7 +213,10 @@ class DefaultFileTransferHandlerTest {
 
     @Test
     void duplicateOfferForAlreadyCompletedTransferIsIgnoredQuietly(@TempDir Path tempDir) throws Exception {
-        Harness h = new Harness(tempDir, 10);
+        // See multiChunkFileWithShortLastChunkReassemblesExactly's comment on why this moved from
+        // chunkSize=10. This test's point is duplicate-offer suppression after completion, not
+        // chunk count, so a single chunk (30 bytes < 1024) is fine here.
+        Harness h = new Harness(tempDir, 1024);
         Path sourceFile = h.writeRandomFile("completed.bin", 30);
         Path saveFile = h.receiverDir.resolve("received.bin");
 
@@ -231,8 +248,11 @@ class DefaultFileTransferHandlerTest {
 
     @Test
     void failedTransferCanBeRetriedOnReOfferAndSucceeds(@TempDir Path tempDir) throws Exception {
-        Harness h = new Harness(tempDir, 10);
-        Path sourceFile = h.writeRandomFile("retry-fail.bin", 50);
+        // See multiChunkFileWithShortLastChunkReassemblesExactly's comment on why this moved from
+        // chunkSize=10. 5120 = 5 * 1024 -- an exact multiple, preserving the original "5 chunks"
+        // this test's assertions depend on.
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("retry-fail.bin", 5120);
         Path saveFile = h.receiverDir.resolve("received.bin");
 
         // First attempt: override expected file hash so whole-file SHA-256 validation fails
@@ -259,6 +279,194 @@ class DefaultFileTransferHandlerTest {
     }
 
     // ---------------------------------------------------------------------------------------
+    // pre-m6h-hardening-plan.md finding C-3. Everything below exercises validation that didn't
+    // exist before this fix: FileOfferPayload is entirely wire-supplied, so these construct
+    // offers directly (bypassing Harness.offer()'s auto-computed-valid values) the way a
+    // malicious or simply buggy peer's payload would arrive.
+
+    @Test
+    void offerWithChunkSizeBelowMinimumIsRejectedWithoutCreatingAnyState(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+        List<Harness.CapturedEvent> events = new CopyOnWriteArrayList<>();
+        h.receiverListener = h.captureInto(events);
+
+        String transferId = UUID.randomUUID().toString();
+        int belowMinimum = FileChunker.MIN_CHUNK_SIZE_BYTES - 1;
+        FileOfferPayload badOffer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), belowMinimum,
+                FileChunker.chunkCount(500, belowMinimum), FileKey.generate().bytes());
+
+        h.receiverHandler.onFileOffer(h.senderId, badOffer);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isNull(); // never persisted
+        assertThat(events).isEmpty(); // onFileOfferReceived never fired
+    }
+
+    @Test
+    void offerWithChunkSizeAboveMaximumIsRejected(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+
+        String transferId = UUID.randomUUID().toString();
+        int aboveMaximum = FileChunker.MAX_CHUNK_SIZE_BYTES + 1;
+        FileOfferPayload badOffer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), aboveMaximum, 1, FileKey.generate().bytes());
+
+        h.receiverHandler.onFileOffer(h.senderId, badOffer);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isNull();
+    }
+
+    @Test
+    void offerWithZeroOrNegativeTotalChunksIsRejected(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+
+        for (int badTotalChunks : new int[] {0, -1, -1000}) {
+            String transferId = UUID.randomUUID().toString();
+            FileOfferPayload badOffer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                    "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), 1024, badTotalChunks, FileKey.generate().bytes());
+
+            h.receiverHandler.onFileOffer(h.senderId, badOffer);
+
+            assertThat(h.receiverStorage.getTransferState(transferId))
+                    .as("totalChunks=%d should have been rejected", badTotalChunks).isNull();
+        }
+    }
+
+    @Test
+    void offerWithNegativeFileSizeIsRejected(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        String transferId = UUID.randomUUID().toString();
+        FileOfferPayload badOffer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", -1, "0".repeat(64), 1024, 1, FileKey.generate().bytes());
+
+        h.receiverHandler.onFileOffer(h.senderId, badOffer);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isNull();
+    }
+
+    @Test
+    void offerExceedingConfiguredMaxAcceptedFileSizeIsRejected(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        h.maxAcceptedFileSizeBytes = 2048; // small deliberately, so this test doesn't need a huge file
+        h.rebuildBoth();
+        Path sourceFile = h.writeRandomFile("source.bin", 3000); // real file, genuinely over the 2048 cap
+
+        // A claimed size consistent with itself (matches chunkCount) but over the configured cap.
+        String transferId = UUID.randomUUID().toString();
+        FileOfferPayload tooLarge = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 3000, FileChunker.sha256HexOfFile(sourceFile), 1024, FileChunker.chunkCount(3000, 1024),
+                FileKey.generate().bytes());
+
+        h.receiverHandler.onFileOffer(h.senderId, tooLarge);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isNull();
+    }
+
+    @Test
+    void offerWithTotalChunksInconsistentWithFileSizeAndChunkSizeIsRejected(@TempDir Path tempDir) throws Exception {
+        // The exact case the audit named: a claimed totalChunks wildly disproportionate to the
+        // claimed fileSize/chunkSize -- e.g. a small file claiming a huge chunk count -- is
+        // exactly what would have made storage.missingChunks(transferId, totalChunks) build a
+        // giant result before this fix.
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+
+        String transferId = UUID.randomUUID().toString();
+        FileOfferPayload inconsistent = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), 1024, 1_000_000, FileKey.generate().bytes());
+
+        h.receiverHandler.onFileOffer(h.senderId, inconsistent);
+
+        assertThat(h.receiverStorage.getTransferState(transferId)).isNull();
+    }
+
+    @Test
+    void chunkWithOutOfRangeIndexIsRejectedBeforeAnyDiskWrite(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500); // 1 chunk: only index 0 is valid
+        Path saveFile = h.receiverDir.resolve("received.bin");
+
+        // Offer constructed directly, deliberately not via h.offer() and deliberately never
+        // registered with h.senderHandler -- this test needs to control the FileKey (to encrypt
+        // its own crafted chunks below with the *correct* key, or ChunkCipher.decrypt would throw
+        // on the auth-tag check before ever reaching the bounds check this test targets) and
+        // needs acceptFileTransfer's own request/response round trip to come back empty, which it
+        // will: a sender that was never told about this transfer can't answer for it.
+        FileKey key = FileKey.generate();
+        String transferId = UUID.randomUUID().toString();
+        FileOfferPayload offer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), 1024, 1, key.bytes());
+        h.receiverHandler.onFileOffer(h.senderId, offer);
+
+        h.receiverHandler.acceptFileTransfer(transferId, saveFile);
+        assertThat(h.receiverStorage.missingChunks(transferId, 1)).containsExactly(0); // confirms nothing came back
+
+        for (int badIndex : new int[] {-1, 1, 100}) {
+            byte[] plaintext = new byte[10];
+            var encrypted = ChunkCipher.encrypt(key, badIndex, plaintext);
+            FileChunkPayload badChunk = new FileChunkPayload(transferId, badIndex, encrypted.nonce(), encrypted.ciphertext());
+
+            h.receiverHandler.onFileChunk(h.senderId, badChunk);
+        }
+
+        // Still exactly one chunk missing (index 0) -- none of the bad indices touched state,
+        // and critically, the file on disk was never written to at those (wildly out-of-range,
+        // in the badIndex=100 case) offsets.
+        assertThat(h.receiverStorage.missingChunks(transferId, 1)).containsExactly(0);
+    }
+
+    @Test
+    void chunkWithPlaintextLongerThanChunkSizeIsRejected(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500);
+        Path saveFile = h.receiverDir.resolve("received.bin");
+
+        // See chunkWithOutOfRangeIndexIsRejectedBeforeAnyDiskWrite's comment on why this offer is
+        // constructed directly rather than via h.offer().
+        FileKey key = FileKey.generate();
+        String transferId = UUID.randomUUID().toString();
+        FileOfferPayload offer = new FileOfferPayload(transferId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value(),
+                "source.bin", 500, FileChunker.sha256HexOfFile(sourceFile), 1024, 1, key.bytes());
+        h.receiverHandler.onFileOffer(h.senderId, offer);
+
+        h.receiverHandler.acceptFileTransfer(transferId, saveFile);
+        assertThat(h.receiverStorage.missingChunks(transferId, 1)).containsExactly(0); // confirms nothing came back
+
+        byte[] oversizedPlaintext = new byte[1024 + 1]; // one byte over chunkSize
+        var encrypted = ChunkCipher.encrypt(key, 0, oversizedPlaintext); // correct key: decrypts fine, so the length check is what's actually under test
+        FileChunkPayload oversizedChunk = new FileChunkPayload(transferId, 0, encrypted.nonce(), encrypted.ciphertext());
+
+        h.receiverHandler.onFileChunk(h.senderId, oversizedChunk);
+
+        assertThat(h.receiverStorage.missingChunks(transferId, 1)).containsExactly(0); // still missing, not written
+    }
+
+    @Test
+    void chunkRequestWithOutOfRangeIndicesIsIgnoredForThoseIndicesOnly(@TempDir Path tempDir) throws Exception {
+        Harness h = new Harness(tempDir, 1024);
+        Path sourceFile = h.writeRandomFile("source.bin", 500); // 1 chunk: only index 0 is valid
+        FileKey key = FileKey.generate();
+        String transferId = UUID.randomUUID().toString();
+        h.senderHandler.registerOutgoingTransfer(transferId, sourceFile, key, 1024,
+                h.receiverId, "/ip4/10.0.0.2/tcp/9000/p2p/" + h.receiverId.value(), null);
+
+        AtomicInteger chunksSent = new AtomicInteger();
+        h.senderHandler.attach((target, direct, relay, msg) -> {
+            chunksSent.incrementAndGet();
+            return CompletableFuture.completedFuture(ConnectivityStatus.DIRECT);
+        }, h.senderId, "/ip4/10.0.0.1/tcp/9000/p2p/" + h.senderId.value());
+
+        h.senderHandler.onFileChunkRequest(h.receiverId,
+                new FileChunkRequestPayload(transferId, new int[] {-1, 0, 5, 1000}));
+
+        // Only index 0 (the one genuinely valid index for a 1-chunk transfer) should have
+        // resulted in a send -- the out-of-range ones silently ignored, not attempted.
+        assertThat(chunksSent.get()).isEqualTo(1);
+    }
+
 
     /** Wires two independent DefaultFileTransferHandler instances together via a fake transport. */
     private class Harness {
@@ -276,6 +484,12 @@ class DefaultFileTransferHandlerTest {
         };
         java.util.function.Predicate<FileChunkPayload> senderChunkFilter = chunk -> true;
         String nextOfferFileHashOverride = null;
+        // pre-m6h-hardening-plan.md finding C-3: lets a test exercise the configurable max-file-
+        // size rejection without actually writing a multi-gigabyte file. Must be set before
+        // rebuildBoth() runs (either in a Harness subclass-style pre-set, or by calling
+        // rebuildBoth() again after changing it) since it's only read when the receiver handler
+        // is constructed.
+        long maxAcceptedFileSizeBytes = DefaultFileTransferHandler.DEFAULT_MAX_ACCEPTED_FILE_SIZE_BYTES;
 
         private final DaemonEventListener receiverListenerDelegate = new DaemonEventListener() {
             @Override
@@ -302,7 +516,8 @@ class DefaultFileTransferHandlerTest {
 
         void rebuildBoth() {
             senderHandler = new DefaultFileTransferHandler(senderStorage, DaemonEventListener.NONE);
-            receiverHandler = new DefaultFileTransferHandler(receiverStorage, receiverListenerDelegate);
+            receiverHandler = new DefaultFileTransferHandler(receiverStorage, receiverListenerDelegate,
+                    DefaultFileTransferHandler.DEFAULT_OUTGOING_TRANSFER_TTL, maxAcceptedFileSizeBytes);
             senderHandler.attach(this::routeFromSender, senderId, "/ip4/10.0.0.1/tcp/9000/p2p/" + senderId.value());
             receiverHandler.attach(this::routeFromReceiver, receiverId, "/ip4/10.0.0.2/tcp/9000/p2p/" + receiverId.value());
         }

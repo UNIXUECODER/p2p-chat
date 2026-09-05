@@ -1,10 +1,12 @@
 name: Build & Test CI
 
+# D-2 (pre-M6h hardening audit): this used to trigger only on main/master/develop, so every
+# feature branch — including the one that added this fix — ran no CI at all. `push`/`pull_request`
+# with no `branches` filter runs on everything; the branch protection rule (if any) belongs on
+# the GitHub repo settings side, not here, so this file stays the single source of "does it build".
 on:
   push:
-    branches: [ main, master, develop ]
   pull_request:
-    branches: [ main, master, develop ]
 
 jobs:
   build-and-test:
@@ -26,3 +28,24 @@ jobs:
 
       - name: Build & Run Unit Tests
         run: ./gradlew check test --info
+
+      # D-2: publish per-module JaCoCo reports so real coverage is visible, not just a pass/fail.
+      - name: Generate coverage reports
+        if: always()
+        run: ./gradlew jacocoTestReport
+
+      - name: Upload coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-reports
+          path: '**/build/reports/jacoco/test/'
+          retention-days: 30
+
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: '**/build/reports/tests/test/'
+          retention-days: 30

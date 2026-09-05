@@ -12,6 +12,7 @@ import com.p2pchat.storage.StorageService;
 import com.p2pchat.storage.model.FileTransfer;
 import com.p2pchat.storage.model.TransferState;
 
+import java.io.IOException;
 import java.io.RandomAccessFile;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -86,10 +87,19 @@ import java.util.concurrent.ConcurrentHashMap;
 public final class DefaultFileTransferHandler implements FileTransferHandler {
 
     public static final Duration DEFAULT_OUTGOING_TRANSFER_TTL = Duration.ofHours(24);
+    // pre-m6h-hardening-plan.md finding C-3: "add a configurable maximum accepted file size,
+    // surface offers over it to the UI rather than silently accepting." No UI exists yet to
+    // surface a rejection to (see this class's own Javadoc on not designing for a caller that
+    // doesn't exist) -- offers over the limit are logged and rejected the same way a duplicate or
+    // already-completed offer already is, which is the real, present behavior this can build on
+    // once M7 exists. 2 GiB is a starting default, not a researched number -- easy to override via
+    // the 4-arg constructor below.
+    public static final long DEFAULT_MAX_ACCEPTED_FILE_SIZE_BYTES = 2L * 1024 * 1024 * 1024;
 
     private final StorageService storage;
     private final DaemonEventListener eventListener;
     private final Duration outgoingTransferTtl;
+    private final long maxAcceptedFileSizeBytes;
 
     // Set once via attach() -- see that method's own Javadoc for why these can't be constructor
     // parameters the same way SessionManager's own ownPeerId/sessions can't be.
@@ -106,13 +116,19 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
     private final Map<String, IncomingTransfer> incomingTransfers = new ConcurrentHashMap<>();
 
     public DefaultFileTransferHandler(StorageService storage, DaemonEventListener eventListener) {
-        this(storage, eventListener, DEFAULT_OUTGOING_TRANSFER_TTL);
+        this(storage, eventListener, DEFAULT_OUTGOING_TRANSFER_TTL, DEFAULT_MAX_ACCEPTED_FILE_SIZE_BYTES);
     }
 
     public DefaultFileTransferHandler(StorageService storage, DaemonEventListener eventListener, Duration outgoingTransferTtl) {
+        this(storage, eventListener, outgoingTransferTtl, DEFAULT_MAX_ACCEPTED_FILE_SIZE_BYTES);
+    }
+
+    public DefaultFileTransferHandler(StorageService storage, DaemonEventListener eventListener,
+                                       Duration outgoingTransferTtl, long maxAcceptedFileSizeBytes) {
         this.storage = storage;
         this.eventListener = eventListener;
         this.outgoingTransferTtl = outgoingTransferTtl != null ? outgoingTransferTtl : DEFAULT_OUTGOING_TRANSFER_TTL;
+        this.maxAcceptedFileSizeBytes = maxAcceptedFileSizeBytes;
     }
 
     @Override
@@ -126,8 +142,19 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
     public void registerOutgoingTransfer(String transferId, Path sourceFile, FileKey fileKey, int chunkSize,
                                           PeerId targetPeerId, String targetDirectMultiaddr, String targetRelayMultiaddr) {
         evictExpiredOutgoingTransfers();
+        // totalChunks computed from the real, local source file's actual size -- not trusted from
+        // any caller-supplied value -- specifically so onFileChunkRequest below has something
+        // authoritative to bounds-check a peer's requested indices against. See that method's own
+        // comment on why this exists.
+        long sourceFileSize;
+        try {
+            sourceFileSize = Files.size(sourceFile);
+        } catch (IOException e) {
+            throw new RuntimeException("Failed to read size of outgoing transfer source file " + sourceFile, e);
+        }
+        int totalChunks = FileChunker.chunkCount(sourceFileSize, chunkSize);
         outgoingTransfers.put(transferId, new OutgoingTransfer(
-                sourceFile, fileKey, chunkSize, targetPeerId, targetDirectMultiaddr, targetRelayMultiaddr));
+                sourceFile, fileKey, chunkSize, totalChunks, targetPeerId, targetDirectMultiaddr, targetRelayMultiaddr));
     }
 
     private void evictExpiredOutgoingTransfers() {
@@ -137,6 +164,15 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
 
     @Override
     public void onFileOffer(PeerId sender, FileOfferPayload offer) {
+        String rejection = validateOffer(offer);
+        if (rejection != null) {
+            // Rejected before any state is created -- no IncomingTransfer, no storage row, no
+            // event fired. See DEFAULT_MAX_ACCEPTED_FILE_SIZE_BYTES's own Javadoc on why this
+            // is "logged, not surfaced to a UI" for now: there is no UI yet to surface it to.
+            System.out.println("[file] rejecting offer " + offer.transferId() + " from " + sender + ": " + rejection);
+            return;
+        }
+
         IncomingTransfer existing = incomingTransfers.get(offer.transferId());
         if (existing != null && existing.outputFile != null) {
             // Already accepted and (maybe) in progress -- a re-offer here is a sender retry, not
@@ -171,6 +207,43 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
                 + " bytes, " + offer.totalChunks() + " chunks) from " + sender + " - awaiting accept");
 
         eventListener.onFileOfferReceived(offer.transferId(), sender, offer.fileName(), offer.fileSize());
+    }
+
+    /**
+     * pre-m6h-hardening-plan.md finding C-3: {@code FileOfferPayload} is entirely wire-supplied,
+     * entirely attacker-controlled, and until this fix, entirely trusted. {@code totalChunks} in
+     * particular flows straight into {@code storage.missingChunks(transferId, totalChunks)} both
+     * here (indirectly, via the {@link IncomingTransfer} this creates) and in {@link
+     * #acceptFileTransfer} — an offer claiming a multi-billion {@code totalChunks} would have
+     * made that call build a multi-billion-entry result before a single byte of the file ever
+     * existed. Returns a human-readable rejection reason, or {@code null} if the offer is
+     * internally consistent and within configured bounds. Deliberately returns a reason rather
+     * than throwing: an invalid offer from a peer is an expected, not exceptional, condition —
+     * same treatment {@link #onFileOffer} already gives a duplicate or already-completed offer.
+     */
+    private String validateOffer(FileOfferPayload offer) {
+        if (offer.chunkSize() < FileChunker.MIN_CHUNK_SIZE_BYTES || offer.chunkSize() > FileChunker.MAX_CHUNK_SIZE_BYTES) {
+            return "chunkSize " + offer.chunkSize() + " outside allowed range ["
+                    + FileChunker.MIN_CHUNK_SIZE_BYTES + ", " + FileChunker.MAX_CHUNK_SIZE_BYTES + "]";
+        }
+        if (offer.totalChunks() <= 0) {
+            return "totalChunks " + offer.totalChunks() + " must be positive";
+        }
+        if (offer.fileSize() < 0) {
+            return "fileSize " + offer.fileSize() + " is negative";
+        }
+        if (offer.fileSize() > maxAcceptedFileSizeBytes) {
+            return "fileSize " + offer.fileSize() + " exceeds configured maximum " + maxAcceptedFileSizeBytes;
+        }
+        // Reuses the same ceil-div FileChunker.chunkCount already uses to compute totalChunks on
+        // the sending side, rather than duplicating the formula -- so an offer is only accepted
+        // if it's consistent with what an honest sender would itself have computed.
+        int expectedTotalChunks = FileChunker.chunkCount(offer.fileSize(), offer.chunkSize());
+        if (offer.totalChunks() != expectedTotalChunks) {
+            return "totalChunks " + offer.totalChunks() + " inconsistent with fileSize/chunkSize (expected "
+                    + expectedTotalChunks + ")";
+        }
+        return null;
     }
 
     /**
@@ -220,6 +293,21 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
         transfer.lastActivityEpochMs = System.currentTimeMillis();
         System.out.println("[file] chunk request received: " + request.missingChunkIndices().length + " chunk(s) requested");
 
+        // Found alongside C-3, not named by the audit itself -- the mirror-image gap on the
+        // sending side. missingChunkIndices() is exactly as wire-supplied and attacker-controlled
+        // (by whoever this transfer's *receiver* is) as anything in FileOfferPayload. It was
+        // already true that FileChunker.readChunk can't be tricked into reading past the real
+        // source file's actual length (it bounds-checks against raf.length(), not any claimed
+        // metadata) -- but rejecting an obviously-invalid index here, before ever touching disk,
+        // is still strictly better than relying on that as the only line of defence, and it's a
+        // three-line addition now that totalChunks is available (see registerOutgoingTransfer).
+        //
+        // Deliberately NOT doing here: capping the number of indices per request, or deduping
+        // repeated valid indices. A receiver that repeatedly requests the same valid, in-bounds
+        // index is a resource-amplification concern (real disk/CPU/network work per request), not
+        // a bounds/validation one -- squarely the kind of thing Track C's own general
+        // rate-limiting work should own, not a one-off special case bolted on here.
+        //
         // Sent one at a time, each waiting for the previous to complete, rather than firing all
         // of them at OutboundMessageService's pool at once. Not a correctness requirement --
         // handleChunk below writes each chunk to its own byte offset, so arrival order genuinely
@@ -228,6 +316,11 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
         // originally-proven demo logic, which only ever sent one chunk at a time by construction).
         CompletableFuture<?> chain = CompletableFuture.completedFuture(null);
         for (int chunkIndex : request.missingChunkIndices()) {
+            if (chunkIndex < 0 || chunkIndex >= transfer.totalChunks) {
+                System.out.println("[file] ignoring out-of-range chunk request: index=" + chunkIndex
+                        + " totalChunks=" + transfer.totalChunks + " transferId=" + request.transferId());
+                continue;
+            }
             chain = chain.thenCompose(ignored -> {
                 byte[] plaintextChunk = FileChunker.readChunk(transfer.sourceFile, chunkIndex, transfer.chunkSize);
                 EncryptedChunk encrypted = ChunkCipher.encrypt(transfer.fileKey, chunkIndex, plaintextChunk);
@@ -238,6 +331,14 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
                         transfer.targetPeerId, transfer.targetDirectMultiaddr, transfer.targetRelayMultiaddr, chunkPayload);
             });
         }
+        // Also found alongside C-3: `chain` was never given an exceptionally() handler anywhere,
+        // so a failure partway through (a bad read, a send failure) completed that stage
+        // exceptionally and silently -- no log line, nothing. Not a security fix by itself, but
+        // directly adjacent to code this fix already touches, and cheap to close at the same time.
+        chain.exceptionally(ex -> {
+            System.out.println("[file] chunk-send chain for transfer " + request.transferId() + " failed: " + ex);
+            return null;
+        });
     }
 
     @Override
@@ -261,8 +362,32 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
             return;
         }
 
+        // pre-m6h-hardening-plan.md finding C-3, the specific case it names: chunkIndex is
+        // wire-supplied and was used directly in a seek() offset with no bounds check at all.
+        // Checked before decrypting, not just before the seek -- cheaper to reject an obviously
+        // invalid index than to spend a decrypt on it first, and there's no reason chunkIndex
+        // needs the plaintext to validate.
+        if (chunk.chunkIndex() < 0 || chunk.chunkIndex() >= transfer.totalChunks) {
+            System.out.println("[file] rejecting chunk with out-of-range index=" + chunk.chunkIndex()
+                    + " totalChunks=" + transfer.totalChunks + " transferId=" + chunk.transferId());
+            return;
+        }
+
         EncryptedChunk encrypted = new EncryptedChunk(chunk.chunkIndex(), chunk.nonce(), chunk.ciphertext());
         byte[] plaintext = ChunkCipher.decrypt(transfer.fileKey, encrypted); // throws (unchecked) on tamper -- caught by SessionManager's own outer catch, same as any other malformed inbound data
+
+        // The other half of C-3: a chunk whose plaintext is longer than chunkSize would, without
+        // this check, have overwritten the start of the *next* chunk's region on disk --
+        // raf.write() at offset chunkIndex*chunkSize doesn't know or care where chunk
+        // (chunkIndex+1) begins. This can't happen from an honest sender (FileChunker.readChunk
+        // never returns more than chunkSize bytes) but nothing before this fix stopped a
+        // malicious one from claiming a normal chunkIndex/nonce while smuggling oversized
+        // plaintext in the ciphertext.
+        if (plaintext.length > transfer.chunkSize) {
+            System.out.println("[file] rejecting chunk " + chunk.chunkIndex() + ": decrypted length "
+                    + plaintext.length + " exceeds chunkSize " + transfer.chunkSize + " transferId=" + chunk.transferId());
+            return;
+        }
 
         try (RandomAccessFile raf = new RandomAccessFile(destination.toFile(), "rw")) {
             raf.seek((long) chunk.chunkIndex() * transfer.chunkSize);
@@ -342,17 +467,19 @@ public final class DefaultFileTransferHandler implements FileTransferHandler {
         final Path sourceFile;
         final FileKey fileKey;
         final int chunkSize;
+        final int totalChunks; // computed from the real source file's size -- see registerOutgoingTransfer
         final PeerId targetPeerId;
         final String targetDirectMultiaddr;
         final String targetRelayMultiaddr;
         final long createdAtEpochMs;
         volatile long lastActivityEpochMs;
 
-        OutgoingTransfer(Path sourceFile, FileKey fileKey, int chunkSize, PeerId targetPeerId,
+        OutgoingTransfer(Path sourceFile, FileKey fileKey, int chunkSize, int totalChunks, PeerId targetPeerId,
                           String targetDirectMultiaddr, String targetRelayMultiaddr) {
             this.sourceFile = sourceFile;
             this.fileKey = fileKey;
             this.chunkSize = chunkSize;
+            this.totalChunks = totalChunks;
             this.targetPeerId = targetPeerId;
             this.targetDirectMultiaddr = targetDirectMultiaddr;
             this.targetRelayMultiaddr = targetRelayMultiaddr;

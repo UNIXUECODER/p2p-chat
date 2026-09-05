@@ -17,6 +17,14 @@ public final class FileChunker {
 
     public static final int DEFAULT_CHUNK_SIZE_BYTES = 256 * 1024;
 
+    // pre-m6h-hardening-plan.md finding C-3's suggested range. Bounding chunkSize matters on both
+    // ends: too small and totalChunks for a given file balloons (see DefaultFileTransferHandler's
+    // own totalChunks/fileSize consistency check, which these bounds work together with); too
+    // large and a single chunk's plaintext buffer (allocated whole, per readChunk/onFileChunk)
+    // stops being a bounded, predictable allocation.
+    public static final int MIN_CHUNK_SIZE_BYTES = 1024; // 1 KiB
+    public static final int MAX_CHUNK_SIZE_BYTES = 8 * 1024 * 1024; // 8 MiB
+
     private FileChunker() {
     }
 

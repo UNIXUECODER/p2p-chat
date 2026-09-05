@@ -1,3 +1,5 @@
+import org.gradle.testing.jacoco.tasks.JacocoReport
+
 allprojects {
     group = "com.p2pchat"
     version = "0.1.0"
@@ -16,6 +18,12 @@ allprojects {
 
 subprojects {
     apply(plugin = "java")
+    // D-2 (pre-M6h hardening audit): coverage tooling didn't exist anywhere in the repo, so the
+    // true coverage number was unknown. jacoco is applied per-subproject rather than via a
+    // cross-module aggregation plugin — real per-module reports today, deliberately not a single
+    // merged number, which would need jacoco's report-aggregation plugin and its own module.
+    // That's a reasonable follow-up, not bundled into this hygiene pass.
+    apply(plugin = "jacoco")
 
     configure<JavaPluginExtension> {
         toolchain {
@@ -32,5 +40,14 @@ subprojects {
 
     tasks.withType<Test> {
         useJUnitPlatform()
+        finalizedBy(tasks.named("jacocoTestReport"))
+    }
+
+    tasks.named<JacocoReport>("jacocoTestReport") {
+        dependsOn(tasks.named("test"))
+        reports {
+            xml.required.set(true)
+            html.required.set(true)
+        }
     }
 }
