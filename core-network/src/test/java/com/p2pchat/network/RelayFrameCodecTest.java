@@ -46,8 +46,11 @@ class RelayFrameCodecTest {
 
     @Test
     void rejectOversizedPeerIdLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 0x01);
+        buf.put((byte) 1); // PROTOCOL_VERSION -- without this, byte 1 of the length below gets
+                            // misread as the version byte instead of exercising the length check
+                            // this test is actually about (see B-1's own commit message)
         buf.putInt(999_999_999); // far more than what's actually in the buffer
         assertThatThrownBy(() -> RelayFrameCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -56,12 +59,26 @@ class RelayFrameCodecTest {
 
     @Test
     void rejectNegativePeerIdLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 0x01);
+        buf.put((byte) 1); // PROTOCOL_VERSION -- see rejectOversizedPeerIdLength's comment
         buf.putInt(-1);
         assertThatThrownBy(() -> RelayFrameCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Malformed length-prefixed field");
+    }
+
+    // --- pre-m6h-hardening-plan.md finding B-1 ---
+
+    @Test
+    void rejectUnsupportedProtocolVersion() {
+        byte[] wire = RelayFrameCodec.encode(new RelayFrame(true, "peer-1", "payload".getBytes()));
+        wire[1] = 99; // corrupt the version byte only, leave the marker and everything else valid
+
+        assertThatThrownBy(() -> RelayFrameCodec.decode(wire))
+                .isInstanceOf(UnsupportedProtocolVersionException.class)
+                .isInstanceOf(IllegalArgumentException.class) // still catchable by existing broad catch sites
+                .hasMessageContaining("99");
     }
 
     @Test

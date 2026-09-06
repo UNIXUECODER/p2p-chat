@@ -10,6 +10,10 @@ import com.p2pchat.messaging.HybridLogicalClock;
 import com.p2pchat.messaging.wire.ChatMessageCodec;
 import com.p2pchat.messaging.wire.ChatMessagePayload;
 import com.p2pchat.messaging.wire.DeliveryReceiptPayload;
+import com.p2pchat.messaging.wire.HandshakeInitPayload;
+import com.p2pchat.messaging.wire.HandshakeMessageCodec;
+import com.p2pchat.messaging.wire.HandshakeResponsePayload;
+import com.p2pchat.messaging.wire.HandshakeWireMessage;
 import com.p2pchat.messaging.wire.ReadReceiptPayload;
 import com.p2pchat.model.PeerId;
 import com.p2pchat.network.ConnectivityStatus;
@@ -29,6 +33,7 @@ import java.nio.file.Path;
 import java.sql.ResultSet;
 import java.sql.Statement;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -397,6 +402,50 @@ class SessionManagerReceivePipelineTest {
         assertThatThrownBy(() -> unstarted.acceptFileTransfer("t1", dummy))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("must be called before use");
+    }
+
+    // --- pre-m6h-hardening-plan.md finding B-2 ---
+
+    @Test
+    void receivingHandshakeInitRecordsCapabilitiesAndRepliesWithResponse() throws Exception {
+        HandshakeInitPayload init = new HandshakeInitPayload(senderAddress, Set.of("file-transfer"));
+
+        sessionManager.handleDecryptedPlaintext(senderPeerId, HandshakeMessageCodec.encode(init));
+
+        // Recorded regardless of whether the reply below succeeds -- see peerSupports's own
+        // Javadoc on why recording and replying are two separate concerns, not one.
+        assertThat(sessionManager.peerSupports(senderPeerId, "file-transfer")).isTrue();
+        assertThat(sessionManager.peerSupports(senderPeerId, "some-capability-nobody-declared")).isFalse();
+
+        // The reply itself: a real HandshakeResponsePayload, encrypted and sent back to exactly
+        // the address the INIT itself carried (senderAddress) -- not any network-layer-derived
+        // address, matching the same chat.senderAddress()-for-replies convention this class
+        // already uses for delivery receipts.
+        awaitSentCount(1);
+        assertThat(fakeNetwork.sentTo()).containsExactly(senderAddress);
+
+        byte[] replyPlaintext = fakeSessions.encryptedPlaintexts().get(fakeSessions.encryptedPlaintexts().size() - 1);
+        DispatchedMessage dispatched = ApplicationMessageRouter.dispatch(replyPlaintext);
+        assertThat(dispatched).isInstanceOf(DispatchedMessage.Handshake.class);
+        HandshakeWireMessage replyMessage = ((DispatchedMessage.Handshake) dispatched).message();
+        assertThat(replyMessage).isInstanceOf(HandshakeResponsePayload.class);
+        assertThat(((HandshakeResponsePayload) replyMessage).supportedCapabilities()).contains("file-transfer");
+    }
+
+    @Test
+    void receivingHandshakeResponseRecordsCapabilitiesWithoutReplying() throws Exception {
+        HandshakeResponsePayload response = new HandshakeResponsePayload(senderAddress, Set.of("file-transfer"));
+
+        sessionManager.handleDecryptedPlaintext(senderPeerId, HandshakeMessageCodec.encode(response));
+
+        assertThat(sessionManager.peerSupports(senderPeerId, "file-transfer")).isTrue();
+        // A RESPONSE is the second half of the handshake, not a new INIT -- replying to a reply
+        // would loop forever between two nodes that both auto-reply. Give any (wrongly) triggered
+        // async send a moment to happen before asserting it didn't, rather than asserting
+        // immediately against a naturally-empty list that would pass even if the bug existed and
+        // just hadn't completed yet.
+        Thread.sleep(100);
+        assertThat(fakeNetwork.sentTo()).isEmpty();
     }
 
     // ---------------------------------------------------------------- raw SQL verification helpers

@@ -2,6 +2,7 @@ package com.p2pchat.daemon.dispatch;
 
 import com.p2pchat.filetransfer.wire.FileTransferMessageCodec;
 import com.p2pchat.messaging.wire.ChatMessageCodec;
+import com.p2pchat.messaging.wire.HandshakeMessageCodec;
 
 /**
  * M6a: routes one decrypted application-layer payload — the plaintext {@code
@@ -73,13 +74,8 @@ public final class ApplicationMessageRouter {
                     new DispatchedMessage.Chat(ChatMessageCodec.decode(plaintext));
             case FILE_OFFER, FILE_CHUNK_REQUEST, FILE_CHUNK ->
                     new DispatchedMessage.FileTransfer(FileTransferMessageCodec.decode(plaintext));
-            case HANDSHAKE_INIT, HANDSHAKE_RESPONSE -> throw new IllegalArgumentException(
-                    "Marker " + marker + " (HANDSHAKE_INIT/HANDSHAKE_RESPONSE) reached the application " +
-                            "router, which should never happen \u2014 PQXDH session establishment already " +
-                            "happens transparently inside SecureSessionService.decrypt() before any " +
-                            "application-layer plaintext exists. Treat this as a corrupt/malicious payload " +
-                            "unless a later milestone has since added a real application-level handshake " +
-                            "concept (check docs/architecture-spec.md \u00a76 before assuming the former).");
+            case HANDSHAKE_INIT, HANDSHAKE_RESPONSE ->
+                    new DispatchedMessage.Handshake(HandshakeMessageCodec.decode(plaintext));
             case GROUP_OP -> throw new IllegalArgumentException(
                     "Marker 5 (GROUP_OP) is reserved for group chat (M8) and has no codec yet");
             case PRESENCE_PING -> throw new IllegalArgumentException(

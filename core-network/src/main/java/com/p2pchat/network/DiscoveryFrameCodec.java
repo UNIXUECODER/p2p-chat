@@ -13,6 +13,11 @@ import java.nio.charset.StandardCharsets;
  * {@code switch} with a {@code default -> throw} below predates this pass) — but the peer-id
  * length prefix had the same unchecked-allocation gap {@code RelayFrameCodec} did; see that
  * class's Javadoc for why. Fixed the same way here.
+ *
+ * <p><b>pre-m6h-hardening-plan.md finding B-1:</b> a {@link #PROTOCOL_VERSION} byte now follows
+ * the type marker on every frame, same convention as {@code RelayFrameCodec}. {@link #decode}
+ * rejects an unrecognized version with {@link UnsupportedProtocolVersionException}, not the
+ * generic {@link IllegalArgumentException} every other decode failure here throws.
  */
 public final class DiscoveryFrameCodec {
 
@@ -20,6 +25,8 @@ public final class DiscoveryFrameCodec {
     private static final byte LOOKUP_MARKER = 0x02;
     private static final byte FOUND_MARKER = 0x03;
     private static final byte NOT_FOUND_MARKER = 0x04;
+
+    private static final byte PROTOCOL_VERSION = 1;
 
     private DiscoveryFrameCodec() {
     }
@@ -32,8 +39,9 @@ public final class DiscoveryFrameCodec {
             case LOOKUP_RESPONSE_NOT_FOUND -> NOT_FOUND_MARKER;
         };
         byte[] peerIdBytes = frame.peerId().getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + peerIdBytes.length + frame.payload().length);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 1 + 4 + peerIdBytes.length + frame.payload().length);
         buf.put(marker);
+        buf.put(PROTOCOL_VERSION);
         buf.putInt(peerIdBytes.length);
         buf.put(peerIdBytes);
         buf.put(frame.payload());
@@ -41,7 +49,7 @@ public final class DiscoveryFrameCodec {
     }
 
     public static DiscoveryFrame decode(byte[] wire) {
-        if (wire.length < 1) {
+        if (wire.length < 2) {
             throw new IllegalArgumentException("Discovery frame too short: " + wire.length + " bytes");
         }
         ByteBuffer buf = ByteBuffer.wrap(wire);
@@ -53,6 +61,10 @@ public final class DiscoveryFrameCodec {
             case NOT_FOUND_MARKER -> DiscoveryMessageType.LOOKUP_RESPONSE_NOT_FOUND;
             default -> throw new IllegalArgumentException("Unknown discovery frame marker: " + marker);
         };
+        byte version = buf.get();
+        if (version != PROTOCOL_VERSION) {
+            throw new UnsupportedProtocolVersionException(version, PROTOCOL_VERSION);
+        }
         byte[] peerIdBytes = getBytes(buf);
         byte[] payload = new byte[buf.remaining()];
         buf.get(payload);

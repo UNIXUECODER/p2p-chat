@@ -5,6 +5,7 @@ import com.p2pchat.filetransfer.wire.FileChunkRequestPayload;
 import com.p2pchat.filetransfer.wire.FileOfferPayload;
 import com.p2pchat.filetransfer.wire.FileTransferMessage;
 import com.p2pchat.filetransfer.wire.FileTransferMessageCodec;
+import com.p2pchat.filetransfer.wire.UnsupportedProtocolVersionException;
 import org.junit.jupiter.api.Test;
 
 import java.nio.ByteBuffer;
@@ -92,8 +93,11 @@ class FileTransferMessageCodecTest {
 
     @Test
     void rejectOversizedStringLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 6); // FILE_OFFER_MARKER
+        buf.put((byte) 1); // PROTOCOL_VERSION -- without this, byte 1 of Integer.MAX_VALUE below
+                            // gets misread as the version byte instead of exercising the length
+                            // check this test is actually about (see B-1's own commit message)
         buf.putInt(Integer.MAX_VALUE); // transferId's claimed length
         assertThatThrownBy(() -> FileTransferMessageCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -102,8 +106,9 @@ class FileTransferMessageCodecTest {
 
     @Test
     void rejectOversizedChunkIndexCount() {
-        ByteBuffer buf = ByteBuffer.allocate(9);
+        ByteBuffer buf = ByteBuffer.allocate(10);
         buf.put((byte) 7); // FILE_CHUNK_REQUEST_MARKER
+        buf.put((byte) 1); // PROTOCOL_VERSION -- see rejectOversizedStringLength's comment
         buf.putInt(0); // empty (valid) transferId string
         buf.putInt(Integer.MAX_VALUE); // absurd chunk-index count
         assertThatThrownBy(() -> FileTransferMessageCodec.decode(buf.array()))
@@ -116,5 +121,18 @@ class FileTransferMessageCodecTest {
         assertThatThrownBy(() -> FileTransferMessageCodec.decode(new byte[0]))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("File-transfer message too short");
+    }
+
+    // --- pre-m6h-hardening-plan.md finding B-1 ---
+
+    @Test
+    void rejectUnsupportedProtocolVersion() {
+        byte[] wire = FileTransferMessageCodec.encode(new FileChunkRequestPayload("transfer-1", new int[0]));
+        wire[1] = 99; // corrupt the version byte only, leave the marker and everything else valid
+
+        assertThatThrownBy(() -> FileTransferMessageCodec.decode(wire))
+                .isInstanceOf(UnsupportedProtocolVersionException.class)
+                .isInstanceOf(IllegalArgumentException.class) // still catchable by existing broad catch sites
+                .hasMessageContaining("99");
     }
 }

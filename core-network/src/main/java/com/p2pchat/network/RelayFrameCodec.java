@@ -18,19 +18,28 @@ import java.nio.charset.StandardCharsets;
  * {@code NegativeArraySizeException} on a negative value or attempt an unbounded allocation on a
  * huge one. Both fixed: unknown markers are rejected, and any length-prefixed field's length is
  * checked against the buffer's actual remaining bytes before allocating.
+ * <p><b>pre-m6h-hardening-plan.md finding B-1:</b> a {@link #PROTOCOL_VERSION} byte now follows
+ * the type marker on every frame — done ahead of Track A (relay-as-real-transport) specifically
+ * so the new relay frame types that track adds are versioned from birth, per the audit's own
+ * sequencing. {@link #decode} rejects an unrecognized version with {@link
+ * UnsupportedProtocolVersionException}, not the generic {@link IllegalArgumentException} every
+ * other decode failure here throws.
  */
 public final class RelayFrameCodec {
 
     private static final byte FORWARD_MARKER = 0x01;
     private static final byte DELIVER_MARKER = 0x02;
 
+    private static final byte PROTOCOL_VERSION = 1;
+
     private RelayFrameCodec() {
     }
 
     public static byte[] encode(RelayFrame frame) {
         byte[] peerIdBytes = frame.peerId().getBytes(StandardCharsets.UTF_8);
-        ByteBuffer buf = ByteBuffer.allocate(1 + 4 + peerIdBytes.length + frame.payload().length);
+        ByteBuffer buf = ByteBuffer.allocate(1 + 1 + 4 + peerIdBytes.length + frame.payload().length);
         buf.put(frame.isForwardRequest() ? FORWARD_MARKER : DELIVER_MARKER);
+        buf.put(PROTOCOL_VERSION);
         buf.putInt(peerIdBytes.length);
         buf.put(peerIdBytes);
         buf.put(frame.payload());
@@ -38,7 +47,7 @@ public final class RelayFrameCodec {
     }
 
     public static RelayFrame decode(byte[] wire) {
-        if (wire.length < 1) {
+        if (wire.length < 2) {
             throw new IllegalArgumentException("Relay frame too short: " + wire.length + " bytes");
         }
         ByteBuffer buf = ByteBuffer.wrap(wire);
@@ -50,6 +59,10 @@ public final class RelayFrameCodec {
             isForwardRequest = false;
         } else {
             throw new IllegalArgumentException("Unknown relay frame marker: " + marker);
+        }
+        byte version = buf.get();
+        if (version != PROTOCOL_VERSION) {
+            throw new UnsupportedProtocolVersionException(version, PROTOCOL_VERSION);
         }
         byte[] peerIdBytes = getBytes(buf);
         byte[] payload = new byte[buf.remaining()];

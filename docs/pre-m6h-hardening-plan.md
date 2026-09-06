@@ -1,6 +1,22 @@
 # Pre-M6H Hardening & Remediation Plan
 
 > **Status:** Proposed — not yet started
+>
+> **Update (M6g-5):** Phase 0 (hygiene) and Phase 1 (the four 🔴 findings — C-1 through C-4) below
+> are done and tested (see README's own M6g-5 section and `docs/M6-roadmap-and-decisions.md` for
+> the full writeup, and `docs/verification-vocabulary.md` for what "tested" means here precisely).
+> This document's own findings and reasoning are left exactly as originally written below —
+> this note records status, it doesn't edit the audit. Tracks A and B, and Phases 2 onward, are
+> still open.
+>
+> **Update (M6g-6):** Track B (protocol versioning — B-1, B-2, B-3) below is also done — see
+> README's M6g-6 section and `docs/adr/0001-wire-protocol-compatibility-policy.md`. Writing B-3's
+> ADR surfaced a real gap between the policy it documents and `ApplicationMessageRouter`'s actual
+> behavior for unrecognized markers (throws; the policy says ignore+log) — recorded as a tracked
+> follow-up in the ADR itself, not fixed in the same pass, and not yet run on real hardware (see
+> the same README section for exactly what is and isn't confirmed). Track A remains, next, before
+> M6h.
+>
 > **Author:** Audit pass conducted against commit `3a14054` (M6g-4)
 > **Scope:** Everything that should be done *before* M6h (`DaemonMain`), and before M7 (UI).
 >

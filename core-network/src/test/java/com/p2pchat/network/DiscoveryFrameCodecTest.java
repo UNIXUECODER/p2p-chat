@@ -35,8 +35,11 @@ class DiscoveryFrameCodecTest {
 
     @Test
     void rejectOversizedPeerIdLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 0x01); // PUBLISH_MARKER
+        buf.put((byte) 1); // PROTOCOL_VERSION -- without this, byte 1 of Integer.MAX_VALUE below
+                            // gets misread as the version byte instead of exercising the length
+                            // check this test is actually about (see B-1's own commit message)
         buf.putInt(Integer.MAX_VALUE);
         assertThatThrownBy(() -> DiscoveryFrameCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -48,5 +51,19 @@ class DiscoveryFrameCodecTest {
         assertThatThrownBy(() -> DiscoveryFrameCodec.decode(new byte[0]))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Discovery frame too short");
+    }
+
+    // --- pre-m6h-hardening-plan.md finding B-1 ---
+
+    @Test
+    void rejectUnsupportedProtocolVersion() {
+        byte[] wire = DiscoveryFrameCodec.encode(
+                new DiscoveryFrame(DiscoveryMessageType.LOOKUP, "peer-target-789", "payload".getBytes()));
+        wire[1] = 99; // corrupt the version byte only, leave the marker and everything else valid
+
+        assertThatThrownBy(() -> DiscoveryFrameCodec.decode(wire))
+                .isInstanceOf(UnsupportedProtocolVersionException.class)
+                .isInstanceOf(IllegalArgumentException.class) // still catchable by existing broad catch sites
+                .hasMessageContaining("99");
     }
 }

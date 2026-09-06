@@ -30,12 +30,23 @@ import java.nio.charset.StandardCharsets;
  * {@code switch} with a {@code default -> throw} below predates this pass). {@link #getString}'s
  * length-prefix read had the same unchecked-allocation gap {@code RelayFrameCodec} had — see
  * that class's own Javadoc for why it matters — fixed the same way here.
+ *
+ * <p><b>pre-m6h-hardening-plan.md finding B-1:</b> a {@link #PROTOCOL_VERSION} byte now follows
+ * the type marker on every message — see {@code core-messaging.wire.ChatMessageCodec}'s
+ * identical change and its own Javadoc for why the marker has to stay at index 0 unmoved
+ * (nothing here plays the {@code ApplicationMessageRouter} peek role {@code ChatMessageCodec}
+ * has to coexist with, but the two codecs share this convention for uniformity, not because
+ * this one strictly needs it). {@link #decode} rejects an unrecognized version with {@link
+ * UnsupportedProtocolVersionException}, not the generic {@link IllegalArgumentException} every
+ * other decode failure here throws.
  */
 public final class FileTransferMessageCodec {
 
     private static final byte FILE_OFFER_MARKER = 6;
     private static final byte FILE_CHUNK_REQUEST_MARKER = 7;
     private static final byte FILE_CHUNK_MARKER = 8;
+
+    private static final byte PROTOCOL_VERSION = 1;
 
     private static final int FILE_KEY_LENGTH = 32;
     private static final int NONCE_LENGTH = 12;
@@ -52,11 +63,15 @@ public final class FileTransferMessageCodec {
     }
 
     public static FileTransferMessage decode(byte[] wire) {
-        if (wire.length < 1) {
+        if (wire.length < 2) {
             throw new IllegalArgumentException("File-transfer message too short: " + wire.length + " bytes");
         }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
+        byte version = buf.get();
+        if (version != PROTOCOL_VERSION) {
+            throw new UnsupportedProtocolVersionException(version, PROTOCOL_VERSION);
+        }
         return switch (marker) {
             case FILE_OFFER_MARKER -> decodeOffer(buf);
             case FILE_CHUNK_REQUEST_MARKER -> decodeRequest(buf);
@@ -74,7 +89,7 @@ public final class FileTransferMessageCodec {
             throw new IllegalArgumentException("fileKey must be " + FILE_KEY_LENGTH + " bytes, got " + offer.fileKey().length);
         }
 
-        int size = 1
+        int size = 1 + 1
                 + 4 + transferIdBytes.length
                 + 4 + senderAddressBytes.length
                 + 4 + fileNameBytes.length
@@ -85,6 +100,7 @@ public final class FileTransferMessageCodec {
 
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(FILE_OFFER_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putString(buf, transferIdBytes);
         putString(buf, senderAddressBytes);
         putString(buf, fileNameBytes);
@@ -113,9 +129,10 @@ public final class FileTransferMessageCodec {
         byte[] transferIdBytes = utf8(request.transferId());
         int[] indices = request.missingChunkIndices();
 
-        int size = 1 + 4 + transferIdBytes.length + 4 + (indices.length * 4);
+        int size = 1 + 1 + 4 + transferIdBytes.length + 4 + (indices.length * 4);
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(FILE_CHUNK_REQUEST_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putString(buf, transferIdBytes);
         buf.putInt(indices.length);
         for (int index : indices) {
@@ -147,9 +164,10 @@ public final class FileTransferMessageCodec {
             throw new IllegalArgumentException("nonce must be " + NONCE_LENGTH + " bytes, got " + chunk.nonce().length);
         }
 
-        int size = 1 + 4 + transferIdBytes.length + 4 + NONCE_LENGTH + chunk.ciphertext().length;
+        int size = 1 + 1 + 4 + transferIdBytes.length + 4 + NONCE_LENGTH + chunk.ciphertext().length;
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(FILE_CHUNK_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putString(buf, transferIdBytes);
         buf.putInt(chunk.chunkIndex());
         buf.put(chunk.nonce());

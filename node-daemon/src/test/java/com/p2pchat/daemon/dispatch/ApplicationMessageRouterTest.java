@@ -8,6 +8,9 @@ import com.p2pchat.messaging.HlcTimestamp;
 import com.p2pchat.messaging.wire.ChatMessageCodec;
 import com.p2pchat.messaging.wire.ChatMessagePayload;
 import com.p2pchat.messaging.wire.DeliveryReceiptPayload;
+import com.p2pchat.messaging.wire.HandshakeInitPayload;
+import com.p2pchat.messaging.wire.HandshakeMessageCodec;
+import com.p2pchat.messaging.wire.HandshakeResponsePayload;
 import com.p2pchat.messaging.wire.ReadReceiptPayload;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
@@ -15,6 +18,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -139,6 +143,32 @@ class ApplicationMessageRouterTest {
     }
 
     @Nested
+    class HandshakeMarkers {
+
+        @Test
+        void routesHandshakeInitToHandshake() {
+            HandshakeInitPayload original = new HandshakeInitPayload(
+                    "/ip4/127.0.0.1/tcp/9100/p2p/12D3KooWSender", Set.of("file-transfer"));
+
+            DispatchedMessage dispatched = ApplicationMessageRouter.dispatch(HandshakeMessageCodec.encode(original));
+
+            assertThat(dispatched).isInstanceOf(DispatchedMessage.Handshake.class);
+            assertThat(((DispatchedMessage.Handshake) dispatched).message()).isEqualTo(original);
+        }
+
+        @Test
+        void routesHandshakeResponseToHandshake() {
+            HandshakeResponsePayload original = new HandshakeResponsePayload(
+                    "/ip4/127.0.0.1/tcp/9200/p2p/12D3KooWReceiver", Set.of("file-transfer"));
+
+            DispatchedMessage dispatched = ApplicationMessageRouter.dispatch(HandshakeMessageCodec.encode(original));
+
+            assertThat(dispatched).isInstanceOf(DispatchedMessage.Handshake.class);
+            assertThat(((DispatchedMessage.Handshake) dispatched).message()).isEqualTo(original);
+        }
+    }
+
+    @Nested
     class RejectedInput {
 
         @Test
@@ -153,14 +183,6 @@ class ApplicationMessageRouterTest {
             assertThatThrownBy(() -> ApplicationMessageRouter.dispatch(new byte[0]))
                     .isInstanceOf(IllegalArgumentException.class)
                     .hasMessageContaining("empty");
-        }
-
-        @ParameterizedTest
-        @ValueSource(bytes = {0, 1})
-        void rejectsHandshakeMarkersAsReachingRouterUnexpectedly(byte marker) {
-            assertThatThrownBy(() -> ApplicationMessageRouter.dispatch(new byte[]{marker, 0, 0, 0}))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("HANDSHAKE");
         }
 
         @Test

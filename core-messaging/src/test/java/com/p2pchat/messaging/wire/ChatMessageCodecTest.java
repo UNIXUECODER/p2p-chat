@@ -167,8 +167,11 @@ class ChatMessageCodecTest {
 
     @Test
     void rejectOversizedFieldLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 2); // CHAT_MESSAGE_MARKER
+        buf.put((byte) 1); // PROTOCOL_VERSION -- without this, byte 1 of Integer.MAX_VALUE below
+                            // gets misread as the version byte instead of exercising the length
+                            // check this test is actually about (see B-1's own commit message)
         buf.putInt(Integer.MAX_VALUE); // messageId's claimed length
         assertThatThrownBy(() -> ChatMessageCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -177,8 +180,9 @@ class ChatMessageCodecTest {
 
     @Test
     void rejectNegativeFieldLength() {
-        ByteBuffer buf = ByteBuffer.allocate(5);
+        ByteBuffer buf = ByteBuffer.allocate(6);
         buf.put((byte) 2); // CHAT_MESSAGE_MARKER
+        buf.put((byte) 1); // PROTOCOL_VERSION -- see rejectOversizedFieldLength's comment
         buf.putInt(-1);
         assertThatThrownBy(() -> ChatMessageCodec.decode(buf.array()))
                 .isInstanceOf(IllegalArgumentException.class)
@@ -190,5 +194,18 @@ class ChatMessageCodecTest {
         assertThatThrownBy(() -> ChatMessageCodec.decode(new byte[0]))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Chat message too short");
+    }
+
+    // --- pre-m6h-hardening-plan.md finding B-1 ---
+
+    @Test
+    void rejectUnsupportedProtocolVersion() {
+        byte[] wire = ChatMessageCodec.encode(new DeliveryReceiptPayload("conv-1", MESSAGE_ID));
+        wire[1] = 99; // corrupt the version byte only, leave the marker and everything else valid
+
+        assertThatThrownBy(() -> ChatMessageCodec.decode(wire))
+                .isInstanceOf(UnsupportedProtocolVersionException.class)
+                .isInstanceOf(IllegalArgumentException.class) // still catchable by existing broad catch sites
+                .hasMessageContaining("99");
     }
 }

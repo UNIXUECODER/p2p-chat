@@ -20,6 +20,10 @@ import com.p2pchat.messaging.wire.ChatMessageCodec;
 import com.p2pchat.messaging.wire.ChatMessagePayload;
 import com.p2pchat.messaging.wire.ChatWireMessage;
 import com.p2pchat.messaging.wire.DeliveryReceiptPayload;
+import com.p2pchat.messaging.wire.HandshakeInitPayload;
+import com.p2pchat.messaging.wire.HandshakeMessageCodec;
+import com.p2pchat.messaging.wire.HandshakeResponsePayload;
+import com.p2pchat.messaging.wire.HandshakeWireMessage;
 import com.p2pchat.messaging.wire.ReadReceiptPayload;
 import com.p2pchat.model.DeviceId;
 import com.p2pchat.model.PeerId;
@@ -41,7 +45,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -139,6 +146,13 @@ import java.util.concurrent.Executors;
  */
 public final class SessionManager implements AutoCloseable {
 
+    // pre-m6h-hardening-plan.md finding B-2: this build's honest, current capability list -- not
+    // "relay-spool"/"groups"/"mls" from the audit's own illustrative list, since none of those
+    // are real features yet. A future milestone adding one of those adds one string here, not a
+    // wire-format change (see HandshakeInitPayload's own Javadoc on why the wire shape is an
+    // open-ended Set<String>, not a closed enum).
+    private static final Set<String> SUPPORTED_CAPABILITIES = Set.of("file-transfer");
+
     private final PeerNetworkService network;
     private final StorageService storage;
     private final SignalProtocolStore signalStore;
@@ -148,6 +162,14 @@ public final class SessionManager implements AutoCloseable {
     private final OutboundMessageService outbound;
     private final ExecutorService inboundExecutor;
     private final ExecutorService eventExecutor;
+
+    // What each peer has told us it supports, keyed by PeerId.value(). Populated from either
+    // direction of the B-2 handshake -- receiving an INIT records it (before replying), receiving
+    // a RESPONSE records it (no further reply needed). Deliberately not persisted to storage: this
+    // is live-session-negotiated state, re-established fresh every time a session is (re-)made,
+    // same lifecycle as the session itself rather than the durable identity/message data storage
+    // actually owns.
+    private final Map<String, Set<String>> peerCapabilities = new ConcurrentHashMap<>();
 
     // Set once, at the end of start() -- see class Javadoc for why these can't be constructed
     // any earlier: the local libp2p peer id (and therefore the local SignalProtocolAddress and
@@ -173,6 +195,19 @@ public final class SessionManager implements AutoCloseable {
         this.outbound = new OutboundMessageService(connectionStrategy, Duration.ofSeconds(15));
         this.inboundExecutor = Executors.newSingleThreadExecutor();
         this.eventExecutor = Executors.newSingleThreadExecutor();
+    }
+
+    /**
+     * Whether {@code peerId} has declared support for {@code capability} via a B-2 handshake.
+     * Returns {@code false} for a peer that hasn't completed a handshake yet, not an exception —
+     * "unknown" and "known not to support it" are deliberately indistinguishable to a caller,
+     * since either way the answer to "can I use this capability with them" is the same: no. This
+     * is the exact query method the audit named as the point of B-2 ("what makes M8 additive
+     * rather than breaking") — a future M8 checks this before offering to start a group
+     * conversation with a peer, rather than finding out by having the attempt fail.
+     */
+    public boolean peerSupports(PeerId peerId, String capability) {
+        return peerCapabilities.getOrDefault(peerId.value(), Set.of()).contains(capability);
     }
 
     /**
@@ -235,6 +270,15 @@ public final class SessionManager implements AutoCloseable {
                 // own Javadoc for why this fires bare, with no payload, rather than trying to
                 // build the full network.status shape here.
                 emit(listener::onNetworkStatusChanged);
+                // pre-m6h-hardening-plan.md finding B-2: "at session start" means here, the one
+                // and only place a fresh session gets established on the initiating side (the
+                // responding side's equivalent moment is transparent, inside
+                // SecureSessionService.decrypt() -- see handleHandshakeMessage's own comment on
+                // why replying to a received INIT is that side's version of this). Best-effort,
+                // deliberately: a HELLO failure must not turn a working chat send into a failed
+                // one, so failures are logged, not propagated.
+                sendHandshakeHello(remote, targetPeerId.value(), directMultiaddr, relayMultiaddr,
+                        new HandshakeInitPayload(ownAddress, SUPPORTED_CAPABILITIES));
             }
             HlcTimestamp timestamp = clock.now();
             byte[] content = text.getBytes(StandardCharsets.UTF_8);
@@ -268,6 +312,32 @@ public final class SessionManager implements AutoCloseable {
             // specific path means it was never actually persisted, unlike the ordinary
             // UNREACHABLE case this catch block is NOT the only way to reach.
             return CompletableFuture.completedFuture(new ChatSendResult(messageId, ConnectivityStatus.UNREACHABLE));
+        }
+    }
+
+    /**
+     * Encrypts and sends one {@link HandshakeWireMessage} (either direction) to {@code remote} —
+     * shared by both {@link #sendChatMessage}'s outbound INIT and {@link
+     * #handleHandshakeMessage}'s reply RESPONSE, since both are "construct a handshake payload,
+     * encrypt it under an already-established session, send it" with nothing else different.
+     * Fire-and-forget: logs a failure rather than propagating one, since a capability handshake
+     * failing must never be allowed to look like (or cause) a real message-send failure to a
+     * caller who asked for neither.
+     */
+    private void sendHandshakeHello(SignalProtocolAddress remote, String targetPeerIdValue, String directMultiaddr,
+                                     String relayMultiaddr, HandshakeWireMessage payload) {
+        try {
+            EncryptedFrame frame = sessions.encrypt(remote, HandshakeMessageCodec.encode(payload));
+            outbound.send(directMultiaddr, relayMultiaddr, targetPeerIdValue, EncryptedFrameCodec.encode(frame))
+                    .whenComplete((status, error) -> {
+                        if (error != null) {
+                            System.err.println("[session-manager] failed to send handshake hello to " + targetPeerIdValue + ": " + error);
+                        } else if (status == ConnectivityStatus.UNREACHABLE) {
+                            System.out.println("[session-manager] handshake hello to " + targetPeerIdValue + " could not be delivered (peer unreachable)");
+                        }
+                    });
+        } catch (Exception e) {
+            System.err.println("[session-manager] failed to encrypt/send handshake hello to " + targetPeerIdValue + ": " + e);
         }
     }
 
@@ -390,6 +460,32 @@ public final class SessionManager implements AutoCloseable {
         switch (dispatched) {
             case DispatchedMessage.Chat chat -> handleChatMessage(sender, chat.message());
             case DispatchedMessage.FileTransfer file -> handleFileTransferMessage(sender, file.message());
+            case DispatchedMessage.Handshake handshake -> handleHandshakeMessage(sender, handshake.message());
+        }
+    }
+
+    /**
+     * pre-m6h-hardening-plan.md finding B-2. Records the sender's declared capabilities either
+     * way; additionally replies with this build's own {@link HandshakeResponsePayload} when what
+     * arrived was an {@link HandshakeInitPayload} — the responding side's equivalent of {@link
+     * #sendChatMessage}'s outbound "at session start" moment, except triggered by receiving the
+     * peer's INIT rather than by this side initiating a send, since PQXDH's own session
+     * establishment on the responding side is transparent (see this class's own Javadoc) and
+     * gives no equivalent explicit hook to send from otherwise.
+     */
+    private void handleHandshakeMessage(PeerId sender, HandshakeWireMessage message) {
+        switch (message) {
+            case HandshakeInitPayload init -> {
+                peerCapabilities.put(sender.value(), init.supportedCapabilities());
+                System.out.println("[session-manager] peer " + sender + " declared capabilities: " + init.supportedCapabilities());
+                SignalProtocolAddress remote = new SignalProtocolAddress(sender.value(), 1);
+                sendHandshakeHello(remote, sender.value(), init.senderAddress(), null,
+                        new HandshakeResponsePayload(ownAddress, SUPPORTED_CAPABILITIES));
+            }
+            case HandshakeResponsePayload response -> {
+                peerCapabilities.put(sender.value(), response.supportedCapabilities());
+                System.out.println("[session-manager] peer " + sender + " declared capabilities: " + response.supportedCapabilities());
+            }
         }
     }
 

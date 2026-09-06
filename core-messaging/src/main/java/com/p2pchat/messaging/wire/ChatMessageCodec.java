@@ -34,12 +34,24 @@ import java.nio.charset.StandardCharsets;
  * {@code switch} with a {@code default -> throw} below predates this pass). {@link #getBytes}'s
  * length-prefix read had the same unchecked-allocation gap {@code RelayFrameCodec} had — see
  * that class's own Javadoc for why it matters — fixed the same way here.
+ *
+ * <p><b>pre-m6h-hardening-plan.md finding B-1:</b> a {@link #PROTOCOL_VERSION} byte now follows
+ * the type marker on every message (still {@code [marker][version][...]}, not
+ * {@code [version][marker][...]} — the marker has to stay at index 0 unmoved, since {@code
+ * ApplicationMessageRouter} peeks {@code plaintext[0]} to decide which codec to even call,
+ * before either codec's {@code decode()} runs; moving the marker would break that dispatch
+ * entirely). {@link #decode} rejects an unrecognized version with {@link
+ * UnsupportedProtocolVersionException}, not the generic {@link IllegalArgumentException} every
+ * other decode failure here throws — see that exception's own Javadoc for why the distinction
+ * matters and why it's still an {@code IllegalArgumentException} subtype.
  */
 public final class ChatMessageCodec {
 
     private static final byte CHAT_MESSAGE_MARKER = 2;
     private static final byte DELIVERY_RECEIPT_MARKER = 3;
     private static final byte READ_RECEIPT_MARKER = 4;
+
+    private static final byte PROTOCOL_VERSION = 1;
 
     private static final byte NO_REPLY = 0;
     private static final byte HAS_REPLY = 1;
@@ -56,11 +68,15 @@ public final class ChatMessageCodec {
     }
 
     public static ChatWireMessage decode(byte[] wire) {
-        if (wire.length < 1) {
+        if (wire.length < 2) {
             throw new IllegalArgumentException("Chat message too short: " + wire.length + " bytes");
         }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
+        byte version = buf.get();
+        if (version != PROTOCOL_VERSION) {
+            throw new UnsupportedProtocolVersionException(version, PROTOCOL_VERSION);
+        }
         return switch (marker) {
             case CHAT_MESSAGE_MARKER -> decodeChatMessage(buf);
             case DELIVERY_RECEIPT_MARKER -> decodeDeliveryReceipt(buf);
@@ -79,7 +95,7 @@ public final class ChatMessageCodec {
         boolean hasReply = chat.replyToMessageId() != null;
         byte[] replyToBytes = hasReply ? utf8(chat.replyToMessageId()) : new byte[0];
 
-        int size = 1
+        int size = 1 + 1
                 + 4 + messageIdBytes.length
                 + 4 + senderAddressBytes.length
                 + 4 + hlcBytes.length
@@ -91,6 +107,7 @@ public final class ChatMessageCodec {
 
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(CHAT_MESSAGE_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putBytes(buf, messageIdBytes);
         putBytes(buf, senderAddressBytes);
         putBytes(buf, hlcBytes);
@@ -120,9 +137,10 @@ public final class ChatMessageCodec {
         byte[] conversationIdBytes = utf8(delivery.conversationId());
         byte[] messageIdBytes = utf8(delivery.messageId());
 
-        int size = 1 + 4 + conversationIdBytes.length + 4 + messageIdBytes.length;
+        int size = 1 + 1 + 4 + conversationIdBytes.length + 4 + messageIdBytes.length;
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(DELIVERY_RECEIPT_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putBytes(buf, conversationIdBytes);
         putBytes(buf, messageIdBytes);
         return buf.array();
@@ -138,9 +156,10 @@ public final class ChatMessageCodec {
         byte[] conversationIdBytes = utf8(read.conversationId());
         byte[] hlcBytes = utf8(read.readUpToHlcTimestamp().toString());
 
-        int size = 1 + 4 + conversationIdBytes.length + 4 + hlcBytes.length;
+        int size = 1 + 1 + 4 + conversationIdBytes.length + 4 + hlcBytes.length;
         ByteBuffer buf = ByteBuffer.allocate(size);
         buf.put(READ_RECEIPT_MARKER);
+        buf.put(PROTOCOL_VERSION);
         putBytes(buf, conversationIdBytes);
         putBytes(buf, hlcBytes);
         return buf.array();

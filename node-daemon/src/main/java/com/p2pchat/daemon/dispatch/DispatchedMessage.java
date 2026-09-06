@@ -2,6 +2,7 @@ package com.p2pchat.daemon.dispatch;
 
 import com.p2pchat.filetransfer.wire.FileTransferMessage;
 import com.p2pchat.messaging.wire.ChatWireMessage;
+import com.p2pchat.messaging.wire.HandshakeWireMessage;
 
 /**
  * The result of routing one decrypted application-layer payload via {@link ApplicationMessageRouter}.
@@ -42,5 +43,18 @@ public sealed interface DispatchedMessage {
      *                {@code FileChunkPayload} — see {@code FileTransferMessage}'s own permits clause.
      */
     record FileTransfer(FileTransferMessage message) implements DispatchedMessage {
+    }
+
+    /**
+     * pre-m6h-hardening-plan.md finding B-2. {@code HANDSHAKE_INIT}/{@code HANDSHAKE_RESPONSE}
+     * markers 0/1 used to reach this router only as a "should never happen" case (PQXDH session
+     * establishment happens one layer below, inside {@code SecureSessionService.decrypt(...)}) —
+     * this is the genuine application-layer handshake concept that assumption anticipated, now
+     * that it exists.
+     *
+     * @param message one of {@code HandshakeInitPayload} or {@code HandshakeResponsePayload} —
+     *                see {@code HandshakeWireMessage}'s own permits clause.
+     */
+    record Handshake(HandshakeWireMessage message) implements DispatchedMessage {
     }
 }
