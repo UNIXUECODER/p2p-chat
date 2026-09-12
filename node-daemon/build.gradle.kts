@@ -124,6 +124,26 @@ tasks.register<JavaExec>("runRelayForward") {
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }
 
+// A-1 (pre-m6h-hardening-plan.md, Track A) -- a persistent, reconnecting, keepalive-monitored
+// relay connection (RelaySession), replacing the per-send dial ConnectionStrategy used to leak.
+// Meant to be left running for the audit's own stated verification window; see
+// PersistentRelayMain's own Javadoc for the actual verification steps.
+tasks.register<JavaExec>("runPersistentRelay") {
+    group = "p2p-chat"
+    description = "A-1: holds a persistent, self-reconnecting relay connection open (RelaySession) -- leave it " +
+            "running to prove it survives idle time and a relay restart. Required: -Prelay=\"...\". " +
+            "Optional: -Ptarget=\"...\" -Pmessage=\"...\" -Pdatadir=.p2p-chat-data"
+    classpath = sourceSets["main"].runtimeClasspath
+    mainClass.set("com.p2pchat.daemon.PersistentRelayMain")
+    val relay = project.findProperty("relay") as String?
+    val target = (project.findProperty("target") as String?) ?: ""
+    val message = (project.findProperty("message") as String?) ?: ""
+    if (relay != null) {
+        args = listOf(relay, target, message)
+    }
+    systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
+}
+
 // M3b — direct-first connection strategy: tries a direct connection, falls
 // back to relay only if that fails or times out, surfacing which path was
 // actually used (ConnectivityStatus) rather than assuming.

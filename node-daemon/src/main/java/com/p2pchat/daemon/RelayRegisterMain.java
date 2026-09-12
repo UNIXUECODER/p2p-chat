@@ -57,6 +57,13 @@ public class RelayRegisterMain {
                     }
                 }
             }
+
+            // A-1: this demo's whole point is exercising the relay connection, so — unlike every
+            // other demo Main's no-op — a disconnect is worth actually printing here.
+            @Override
+            public void onDisconnected(PeerId peerId, RelayController controller) {
+                System.out.println("[relay] disconnected from " + peerId + " (no automatic reconnect in this demo -- see PersistentRelayMain for that)");
+            }
         };
 
         PeerNetworkService network = new Libp2pNetworkService();

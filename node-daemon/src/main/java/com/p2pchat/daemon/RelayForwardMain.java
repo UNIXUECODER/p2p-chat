@@ -36,6 +36,7 @@ public class RelayForwardMain {
         network.start(0, identityService.rawPrivateKeySeed(), (sender, data) -> { }, new RelayEventHandler() {
             @Override public void onConnected(PeerId peerId, RelayController controller) { }
             @Override public void onFrame(PeerId sender, RelayFrame frame) { }
+            @Override public void onDisconnected(PeerId peerId, RelayController controller) { }
         });
 
         RelayController relay = network.connectToRelay(relayAddress, new RelayEventHandler() {
@@ -47,6 +48,11 @@ public class RelayForwardMain {
             @Override
             public void onFrame(PeerId sender, RelayFrame frame) {
                 System.out.println("[relay] unexpected frame received: " + frame);
+            }
+
+            @Override
+            public void onDisconnected(PeerId peerId, RelayController controller) {
+                System.out.println("[relay] disconnected from " + peerId);
             }
         });
 

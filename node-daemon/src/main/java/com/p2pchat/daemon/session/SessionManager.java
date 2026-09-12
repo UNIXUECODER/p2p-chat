@@ -31,6 +31,7 @@ import com.p2pchat.network.ConnectionStrategy;
 import com.p2pchat.network.ConnectivityStatus;
 import com.p2pchat.network.DialableAddressResolver;
 import com.p2pchat.network.PeerNetworkService;
+import com.p2pchat.network.RelaySession;
 import com.p2pchat.storage.StorageService;
 import com.p2pchat.storage.model.Conversation;
 import com.p2pchat.storage.model.ConversationType;
@@ -72,10 +73,14 @@ import java.util.concurrent.Executors;
  *   unmodified contract before assuming it, not taken on faith), so nothing here depends on
  *   discovery (M6f) or an RPC surface (M6g) existing yet.</li>
  *   <li><b>Explicitly deferred, not silently skipped:</b> relay-delivered <i>inbound</i>
- *   reception. {@code start()} below registers only {@code OnEnvelopeMessage}, not a {@code
- *   RelayEventHandler} — nothing through M5e or M6b ever proved receiving a relay-forwarded
- *   message either, so this would be genuinely new networking capability, not just wiring
- *   already-proven pieces together. Named here so it's a tracked gap, not a silent one.</li>
+ *   reception. pre-m6h-hardening-plan.md's Track A / A-1 (a persistent, reconnecting, keepalive-
+ *   monitored {@link RelaySession}, wired in via the 3-arg {@link #start} overload) is done — but
+ *   {@link #handleInboundEnvelope} is still only ever registered as {@code OnEnvelopeMessage},
+ *   never as the session's {@code downstreamHandler}, so a message actually delivered *through*
+ *   the relay still never reaches this class's decrypt/dispatch pipeline. That wiring, plus the
+ *   hardcoded {@code null} relay address in {@link #handleChatMessagePayload}'s delivery-receipt
+ *   reply, is A-2's job specifically, not this one's — named here so it stays a tracked gap, not
+ *   a silent one now that A-1 might otherwise look like the whole story.</li>
  *   <li><b>M6g-3 update:</b> the file-transfer chunk state machine {@code
  *   FileReceiverMain}/{@code FileSenderMain} (M4c/M4d) proved is no longer deferred — {@link
  *   DefaultFileTransferHandler} is a real {@link FileTransferHandler} implementation, and
@@ -158,8 +163,6 @@ public final class SessionManager implements AutoCloseable {
     private final SignalProtocolStore signalStore;
     private final FileTransferHandler fileTransferHandler;
     private final DaemonEventListener listener;
-    private final ConnectionStrategy connectionStrategy;
-    private final OutboundMessageService outbound;
     private final ExecutorService inboundExecutor;
     private final ExecutorService eventExecutor;
 
@@ -179,6 +182,15 @@ public final class SessionManager implements AutoCloseable {
     private volatile HybridLogicalClock clock;
     private volatile SecureSessionService sessions;
 
+    // A-1 update: also set in start(), not the constructor -- ConnectionStrategy needs to know
+    // (at construction) whether a RelaySession backs it, and building one at all means dialing
+    // out via `network`, which can't happen before network.start() has already brought the host
+    // up. relaySession stays null for the 2-arg start() overload (no relay configured) -- see
+    // both overloads below.
+    private volatile ConnectionStrategy connectionStrategy;
+    private volatile OutboundMessageService outbound;
+    private volatile RelaySession relaySession;
+
     public SessionManager(PeerNetworkService network, StorageService storage, SignalProtocolStore signalStore,
                            FileTransferHandler fileTransferHandler) {
         this(network, storage, signalStore, fileTransferHandler, DaemonEventListener.NONE);
@@ -191,8 +203,6 @@ public final class SessionManager implements AutoCloseable {
         this.signalStore = signalStore;
         this.fileTransferHandler = fileTransferHandler;
         this.listener = listener;
-        this.connectionStrategy = new ConnectionStrategy(network, 5_000);
-        this.outbound = new OutboundMessageService(connectionStrategy, Duration.ofSeconds(15));
         this.inboundExecutor = Executors.newSingleThreadExecutor();
         this.eventExecutor = Executors.newSingleThreadExecutor();
     }
@@ -215,8 +225,28 @@ public final class SessionManager implements AutoCloseable {
      * Blocks until the network is up (matching {@code PeerNetworkService.start(...)}'s own
      * convention), but everything after that — decrypting, dispatching, persisting — always
      * happens off this call's thread, on {@link #inboundExecutor}.
+     *
+     * <p>No relay configured — {@link #sendChatMessage}/{@link #sendFile}'s own {@code
+     * relayMultiaddr} parameter still works exactly as before (the legacy per-send dial path, see
+     * {@code ConnectionStrategy}), just without a persistent session backing it. Use the 3-arg
+     * overload to get that.
      */
     public void start(int listenPort, byte[] identityKeySeed) {
+        start(listenPort, identityKeySeed, null);
+    }
+
+    /**
+     * A-1 (pre-m6h-hardening-plan.md, Track A): same as {@link #start(int, byte[])}, plus a
+     * persistent {@link RelaySession} to {@code relayMultiaddr} — reconnecting with backoff and
+     * self-monitoring via keepalive for as long as this daemon runs, instead of {@code
+     * ConnectionStrategy} dialing (and leaking) a fresh relay connection per send. Pass {@code
+     * null} or blank for no relay at all, equivalent to calling the 2-arg overload.
+     *
+     * <p>Does not, by itself, make relay-<i>received</i> messages reach this class's dispatch
+     * pipeline — see this class's own Javadoc, "Explicitly deferred" note, for why that's A-2's
+     * job, not this constructor parameter's.
+     */
+    public void start(int listenPort, byte[] identityKeySeed, String relayMultiaddr) {
         network.start(listenPort, identityKeySeed, this::handleInboundEnvelope);
 
         this.ownAddress = DialableAddressResolver.resolve(network.listenAddresses());
@@ -224,6 +254,15 @@ public final class SessionManager implements AutoCloseable {
         this.ownPeerId = PeerId.of(ownPeerIdValue);
         this.clock = new HybridLogicalClock(ownPeerIdValue);
         this.sessions = new LibsignalSecureSessionService(signalStore, new SignalProtocolAddress(ownPeerIdValue, 1));
+
+        if (relayMultiaddr != null && !relayMultiaddr.isBlank()) {
+            this.relaySession = new RelaySession(network, relayMultiaddr, null, () -> emit(listener::onNetworkStatusChanged));
+            this.relaySession.connect();
+            this.connectionStrategy = new ConnectionStrategy(network, 5_000, relaySession);
+        } else {
+            this.connectionStrategy = new ConnectionStrategy(network, 5_000);
+        }
+        this.outbound = new OutboundMessageService(connectionStrategy, Duration.ofSeconds(15));
 
         // See FileTransferHandler.EncryptAndSend's own Javadoc for why this is a functional
         // interface rather than handing DefaultFileTransferHandler `sessions`/`outbound`
@@ -591,6 +630,16 @@ public final class SessionManager implements AutoCloseable {
      * #handleDecryptedPlaintext} genuinely testable without jvm-libp2p or libsignal-client —
      * everything it touches ({@code storage}, {@code clock}) can be real; only {@code sessions}
      * needs a fake, since the auto-delivery-receipt path calls {@code sessions.encrypt(...)}.
+     *
+     * <p><b>A-1 update:</b> also builds a real {@code connectionStrategy}/{@code outbound} (no
+     * relay session — this is the no-relay path {@link #start(int, byte[])} itself uses), since
+     * A-1 moved their construction out of the constructor and into {@code start(...)} — this
+     * method exists specifically so tests never call that, but {@link
+     * #handleChatMessagePayload}'s auto-delivery-receipt send genuinely needs a real, working
+     * {@code outbound} to reach {@code network.sendEnvelope(...)} through, exactly as it already
+     * did before A-1. Without this, every test in {@code SessionManagerReceivePipelineTest} that
+     * calls {@link #handleDecryptedPlaintext} directly (bypassing {@code start()} on purpose,
+     * per this class's own testable-seam design) would NPE on that send instead.
      */
     void initializeForTesting(PeerId ownPeerId, String ownAddress, HybridLogicalClock clock,
                                SecureSessionService sessions) {
@@ -598,6 +647,8 @@ public final class SessionManager implements AutoCloseable {
         this.ownAddress = ownAddress;
         this.clock = clock;
         this.sessions = sessions;
+        this.connectionStrategy = new ConnectionStrategy(network, 5_000);
+        this.outbound = new OutboundMessageService(connectionStrategy, Duration.ofSeconds(15));
     }
 
     // Same logic as ChatListenerMain's own private helpers (M5c) -- not extracted to a shared
@@ -664,7 +715,12 @@ public final class SessionManager implements AutoCloseable {
     public void close() {
         inboundExecutor.shutdown();
         eventExecutor.shutdown();
-        outbound.close();
+        if (outbound != null) {
+            outbound.close();
+        }
+        if (relaySession != null) {
+            relaySession.close();
+        }
         try {
             network.stop();
         } catch (Exception e) {

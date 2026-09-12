@@ -87,4 +87,37 @@ class RelayFrameCodecTest {
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("Relay frame too short");
     }
+
+    // --- A-1 (pre-m6h-hardening-plan.md, Track A): PING/PONG, the keepalive frame types RelaySession uses. ---
+
+    @Test
+    void encodeDecodePing() {
+        byte[] nonce = ByteBuffer.allocate(8).putLong(42L).array();
+        RelayFrame frame = new RelayFrame(RelayFrameType.PING, "", nonce);
+        byte[] wire = RelayFrameCodec.encode(frame);
+
+        RelayFrame decoded = RelayFrameCodec.decode(wire);
+        assertThat(decoded.type()).isEqualTo(RelayFrameType.PING);
+        assertThat(decoded.peerId()).isEmpty();
+        assertThat(decoded.payload()).isEqualTo(nonce);
+    }
+
+    @Test
+    void encodeDecodePong() {
+        byte[] nonce = ByteBuffer.allocate(8).putLong(42L).array();
+        RelayFrame frame = new RelayFrame(RelayFrameType.PONG, "", nonce);
+        byte[] wire = RelayFrameCodec.encode(frame);
+
+        RelayFrame decoded = RelayFrameCodec.decode(wire);
+        assertThat(decoded.type()).isEqualTo(RelayFrameType.PONG);
+        assertThat(decoded.payload()).isEqualTo(nonce);
+    }
+
+    @Test
+    void theOldBooleanConstructorStillOnlyProducesForwardOrDeliver() {
+        // A-1 added two more kinds, but the M3a constructor/accessor this predates must keep
+        // meaning exactly what it always meant -- see RelayFrame's own Javadoc.
+        assertThat(new RelayFrame(true, "x", new byte[0]).type()).isEqualTo(RelayFrameType.FORWARD);
+        assertThat(new RelayFrame(false, "x", new byte[0]).type()).isEqualTo(RelayFrameType.DELIVER);
+    }
 }

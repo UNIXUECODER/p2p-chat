@@ -50,6 +50,7 @@ public class ReachPeerMain {
         network.start(0, identityService.rawPrivateKeySeed(), (sender, data) -> { }, new RelayEventHandler() {
             @Override public void onConnected(PeerId peerId, RelayController controller) { }
             @Override public void onFrame(PeerId sender, RelayFrame frame) { }
+            @Override public void onDisconnected(PeerId peerId, RelayController controller) { }
         });
 
         ConnectionStrategy strategy = new ConnectionStrategy(network, 3000);

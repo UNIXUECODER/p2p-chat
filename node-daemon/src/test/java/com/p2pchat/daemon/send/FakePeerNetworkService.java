@@ -70,7 +70,18 @@ final class FakePeerNetworkService implements PeerNetworkService {
         if (!relaySucceeds) {
             throw new Exception("simulated relay-connect failure");
         }
-        return frame -> relaySendAttempts.add(frame);
+        // A-1: RelayController gained close(), so this can no longer be a plain lambda.
+        return new RelayController() {
+            @Override
+            public void send(RelayFrame frame) {
+                relaySendAttempts.add(frame);
+            }
+
+            @Override
+            public void close() {
+                // not exercised by ConnectionStrategy/OutboundMessageService's tests
+            }
+        };
     }
 
     // Nothing below this line is exercised by ConnectionStrategy/OutboundMessageService's tests

@@ -8,6 +8,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * M3a: a custom libp2p protocol for relaying arbitrary bytes between two
@@ -55,6 +56,12 @@ public class RelayProtocol extends ProtocolHandler<RelayController> {
         private final CompletableFuture<Void> ready;
         private Stream stream;
 
+        // A-1: onClosed and onReadClosed can both fire for the same stream teardown (e.g. a
+        // half-close followed shortly by a full close) — this flag is what makes onDisconnected's
+        // own contract ("fires once") actually true, rather than relying on the caller to
+        // de-duplicate.
+        private final AtomicBoolean disconnectedFired = new AtomicBoolean(false);
+
         Handler(RelayEventHandler eventHandler, CompletableFuture<Void> ready) {
             this.eventHandler = eventHandler;
             this.ready = ready;
@@ -73,17 +80,32 @@ public class RelayProtocol extends ProtocolHandler<RelayController> {
             byte[] data = new byte[msg.readableBytes()];
             msg.readBytes(data);
             RelayFrame frame = RelayFrameCodec.decode(data);
+            // A-1: PING is answered right here, transparently, on whichever side receives it —
+            // this same Handler class runs as both the relay's and the client's end of the
+            // stream (onStartInitiator/onStartResponder both call onStart), so no relay-server-
+            // specific code is needed for the keepalive to work. Never reaches
+            // RelayEventHandler.onFrame — see RelayFrameType's own Javadoc for why.
+            if (frame.type() == RelayFrameType.PING) {
+                send(new RelayFrame(RelayFrameType.PONG, "", frame.payload()));
+                return;
+            }
             eventHandler.onFrame(PeerId.of(stream.remotePeerId().toString()), frame);
         }
 
         @Override
         public void onClosed(Stream stream) {
-            // no-op for M3a — a real implementation would deregister here; that's an M3b concern
+            fireDisconnected();
         }
 
         @Override
         public void onReadClosed(Stream stream) {
-            // no-op for M3a
+            fireDisconnected();
+        }
+
+        private void fireDisconnected() {
+            if (disconnectedFired.compareAndSet(false, true) && stream != null) {
+                eventHandler.onDisconnected(PeerId.of(stream.remotePeerId().toString()), this);
+            }
         }
 
         @Override
@@ -94,6 +116,22 @@ public class RelayProtocol extends ProtocolHandler<RelayController> {
         @Override
         public void send(RelayFrame frame) {
             stream.writeAndFlush(Unpooled.wrappedBuffer(RelayFrameCodec.encode(frame)));
+        }
+
+        @Override
+        public void close() {
+            // NOT hardware-verified: Stream.close() is assumed here to return a
+            // CompletableFuture<Unit> (the P2PChannel shape used elsewhere in jvm-libp2p, e.g.
+            // Host.stop() in Libp2pNetworkService), same as every other call into a jvm-libp2p
+            // type in this class already is — but this exact method wasn't previously called
+            // anywhere in this codebase, so unlike writeAndFlush/remotePeerId above, no prior
+            // milestone's hardware run has exercised this line specifically. Flagged per this
+            // project's own verification vocabulary, not silently assumed correct: if
+            // `./gradlew :core-network:compileJava` disagrees with this signature, this is the
+            // line to fix.
+            if (stream != null) {
+                stream.close();
+            }
         }
     }
 }

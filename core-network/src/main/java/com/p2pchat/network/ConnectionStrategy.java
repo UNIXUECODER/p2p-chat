@@ -15,15 +15,31 @@ import com.p2pchat.model.PeerId;
  * both paths returns UNREACHABLE rather than propagating an exception, so
  * a caller always gets a definitive answer to act on, never silent
  * ambiguity about what actually happened.
+ *
+ * <p><b>A-1 update (pre-m6h-hardening-plan.md, Track A):</b> the relay leg used to dial a brand
+ * new connection per send and never close it (finding A-2) — real for every send, and a genuine
+ * connection leak. The 3-arg constructor below adds an optional {@link RelaySession}: when
+ * present, the relay leg reuses that persistent, already-reconnecting connection instead of
+ * dialing its own. The original 2-arg constructor is untouched and behaves exactly as before —
+ * every M3b/M6b call site that hasn't been wired to a {@code RelaySession} yet keeps the old
+ * per-send-dial behaviour, not a "different, unproven path." {@link #send}'s own signature hasn't
+ * changed at all: {@code relayMultiaddr} is still accepted (and still used by the legacy path),
+ * just no longer needed to locate the connection when a session-backed instance is in play.
  */
 public class ConnectionStrategy {
 
     private final PeerNetworkService network;
     private final long directTimeoutMillis;
+    private final RelaySession relaySession;
 
     public ConnectionStrategy(PeerNetworkService network, long directTimeoutMillis) {
+        this(network, directTimeoutMillis, null);
+    }
+
+    public ConnectionStrategy(PeerNetworkService network, long directTimeoutMillis, RelaySession relaySession) {
         this.network = network;
         this.directTimeoutMillis = directTimeoutMillis;
+        this.relaySession = relaySession;
     }
 
     /**
@@ -47,7 +63,28 @@ public class ConnectionStrategy {
             }
         }
 
+        if (relaySession != null && targetPeerId != null) {
+            // A-1 path: reuse the persistent session rather than dialing. relayMultiaddr is
+            // intentionally not consulted here — the session was already configured with its own
+            // relay address at construction time (see RelaySession's own Javadoc); accepting a
+            // second, possibly-different address per call isn't a case this project has an actual
+            // use for yet (A-4 territory if it ever becomes one), and silently ignoring a mismatch
+            // is preferable to guessing which one the caller actually meant.
+            return relaySession.send(targetPeerId, data) ? ConnectivityStatus.RELAYED : ConnectivityStatus.UNREACHABLE;
+        }
+
         if (relayMultiaddr != null && targetPeerId != null) {
+            // Legacy path (pre-A-1): dial-per-send, exactly as before -- kept for any caller not
+            // yet constructed with a RelaySession, not a fallback for when the session fails.
+            // Deliberately still doesn't call relay.close() despite RelayController now having
+            // one: every existing verified caller of this path (ReachPeerMain, RelayForwardMain,
+            // OutboundMessageServiceTest's relay-fallback case) relies on writeAndFlush's write
+            // actually reaching the wire before teardown -- see those demo Mains' own
+            // Thread.sleep(500) comments for the exact race this would reopen if closed
+            // immediately after send() with no such wait. RelaySession is the real fix (the
+            // connection is kept, never per-send, so this race can't occur there); patching this
+            // path safely would need the same care and isn't worth the risk to already-verified
+            // code for a path this milestone is actively migrating callers off of.
             try {
                 RelayController relay = network.connectToRelay(relayMultiaddr, new RelayEventHandler() {
                     @Override
@@ -56,6 +93,10 @@ public class ConnectionStrategy {
 
                     @Override
                     public void onFrame(PeerId sender, RelayFrame frame) {
+                    }
+
+                    @Override
+                    public void onDisconnected(PeerId peerId, RelayController controller) {
                     }
                 });
                 relay.send(new RelayFrame(true, targetPeerId, data));

@@ -83,6 +83,7 @@ public class PublishSignedRecordMain {
         }, new RelayEventHandler() {
             @Override public void onConnected(PeerId peerId, RelayController controller) { }
             @Override public void onFrame(PeerId sender, RelayFrame frame) { }
+            @Override public void onDisconnected(PeerId peerId, RelayController controller) { }
         }, new DiscoveryRequestHandler() {
             @Override public void onPublish(PeerId publisher, byte[] payload) { }
             @Override public byte[] onLookup(String targetPeerId) { return null; }

@@ -24,11 +24,18 @@ import java.nio.charset.StandardCharsets;
  * sequencing. {@link #decode} rejects an unrecognized version with {@link
  * UnsupportedProtocolVersionException}, not the generic {@link IllegalArgumentException} every
  * other decode failure here throws.
+ *
+ * <p><b>A-1 update:</b> two more marker values (PING/PONG, see {@link RelayFrameType}) added
+ * alongside the original two. Deliberately not a rewrite: {@link #encode}/{@link #decode}'s
+ * shape, every exception type and message text, and the version-byte handling are all unchanged,
+ * so {@code RelayFrameCodecTest}'s existing cases keep passing against this without modification.
  */
 public final class RelayFrameCodec {
 
     private static final byte FORWARD_MARKER = 0x01;
     private static final byte DELIVER_MARKER = 0x02;
+    private static final byte PING_MARKER = 0x03;
+    private static final byte PONG_MARKER = 0x04;
 
     private static final byte PROTOCOL_VERSION = 1;
 
@@ -38,7 +45,7 @@ public final class RelayFrameCodec {
     public static byte[] encode(RelayFrame frame) {
         byte[] peerIdBytes = frame.peerId().getBytes(StandardCharsets.UTF_8);
         ByteBuffer buf = ByteBuffer.allocate(1 + 1 + 4 + peerIdBytes.length + frame.payload().length);
-        buf.put(frame.isForwardRequest() ? FORWARD_MARKER : DELIVER_MARKER);
+        buf.put(markerFor(frame.type()));
         buf.put(PROTOCOL_VERSION);
         buf.putInt(peerIdBytes.length);
         buf.put(peerIdBytes);
@@ -52,14 +59,7 @@ public final class RelayFrameCodec {
         }
         ByteBuffer buf = ByteBuffer.wrap(wire);
         byte marker = buf.get();
-        boolean isForwardRequest;
-        if (marker == FORWARD_MARKER) {
-            isForwardRequest = true;
-        } else if (marker == DELIVER_MARKER) {
-            isForwardRequest = false;
-        } else {
-            throw new IllegalArgumentException("Unknown relay frame marker: " + marker);
-        }
+        RelayFrameType type = typeFor(marker);
         byte version = buf.get();
         if (version != PROTOCOL_VERSION) {
             throw new UnsupportedProtocolVersionException(version, PROTOCOL_VERSION);
@@ -67,7 +67,29 @@ public final class RelayFrameCodec {
         byte[] peerIdBytes = getBytes(buf);
         byte[] payload = new byte[buf.remaining()];
         buf.get(payload);
-        return new RelayFrame(isForwardRequest, new String(peerIdBytes, StandardCharsets.UTF_8), payload);
+        return new RelayFrame(type, new String(peerIdBytes, StandardCharsets.UTF_8), payload);
+    }
+
+    private static byte markerFor(RelayFrameType type) {
+        return switch (type) {
+            case FORWARD -> FORWARD_MARKER;
+            case DELIVER -> DELIVER_MARKER;
+            case PING -> PING_MARKER;
+            case PONG -> PONG_MARKER;
+        };
+    }
+
+    private static RelayFrameType typeFor(byte marker) {
+        if (marker == FORWARD_MARKER) {
+            return RelayFrameType.FORWARD;
+        } else if (marker == DELIVER_MARKER) {
+            return RelayFrameType.DELIVER;
+        } else if (marker == PING_MARKER) {
+            return RelayFrameType.PING;
+        } else if (marker == PONG_MARKER) {
+            return RelayFrameType.PONG;
+        }
+        throw new IllegalArgumentException("Unknown relay frame marker: " + marker);
     }
 
     /**
