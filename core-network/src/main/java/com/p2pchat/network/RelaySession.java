@@ -183,11 +183,6 @@ public final class RelaySession implements AutoCloseable {
         return relayPeerId;
     }
 
-    /** Exposes the internal RelayEventHandler so host-level stream events route into this session. */
-    public RelayEventHandler eventHandler() {
-        return internalHandler;
-    }
-
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {

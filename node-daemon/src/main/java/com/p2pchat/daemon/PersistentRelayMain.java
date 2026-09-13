@@ -56,32 +56,12 @@ public class PersistentRelayMain {
                 ? identityService.loadIdentity()
                 : identityService.createIdentity("anonymous");
 
-        RelaySession[] sessionHolder = new RelaySession[1];
-        RelayEventHandler hostRelayHandler = new RelayEventHandler() {
-            @Override
-            public void onConnected(PeerId peerId, RelayController controller) {
-                if (sessionHolder[0] != null) {
-                    sessionHolder[0].eventHandler().onConnected(peerId, controller);
-                }
-            }
-
-            @Override
-            public void onFrame(PeerId sender, RelayFrame frame) {
-                if (sessionHolder[0] != null) {
-                    sessionHolder[0].eventHandler().onFrame(sender, frame);
-                }
-            }
-
-            @Override
-            public void onDisconnected(PeerId peerId, RelayController controller) {
-                if (sessionHolder[0] != null) {
-                    sessionHolder[0].eventHandler().onDisconnected(peerId, controller);
-                }
-            }
-        };
-
         PeerNetworkService network = new Libp2pNetworkService();
-        network.start(0, identityService.rawPrivateKeySeed(), (sender, data) -> { }, hostRelayHandler);
+        network.start(0, identityService.rawPrivateKeySeed(), (sender, data) -> { }, new RelayEventHandler() {
+            @Override public void onConnected(PeerId peerId, RelayController controller) { }
+            @Override public void onFrame(PeerId sender, RelayFrame frame) { }
+            @Override public void onDisconnected(PeerId peerId, RelayController controller) { }
+        });
 
         RelayEventHandler downstream = new RelayEventHandler() {
             @Override public void onConnected(PeerId peerId, RelayController controller) { }
@@ -100,6 +80,7 @@ public class PersistentRelayMain {
         // A one-element holder so the connectivity callback (a constructor argument) can read
         // isConnected() off the very RelaySession it's being handed to -- the callback only ever
         // actually runs later (async), by which point sessionHolder[0] is set.
+        RelaySession[] sessionHolder = new RelaySession[1];
         RelaySession session = new RelaySession(network, relayAddress, downstream,
                 () -> log(sessionHolder[0].isConnected() ? "connected (or reconnected)" : "disconnected"));
         sessionHolder[0] = session;
