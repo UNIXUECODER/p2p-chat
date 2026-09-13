@@ -183,7 +183,7 @@ public final class RelaySession implements AutoCloseable {
         return relayPeerId;
     }
 
-    /** Exposes the internal RelayEventHandler so hosts can route stream lifecycle events into this session. */
+    /** Exposes the internal RelayEventHandler so host-level stream events route into this session. */
     public RelayEventHandler eventHandler() {
         return internalHandler;
     }
@@ -214,25 +214,15 @@ public final class RelaySession implements AutoCloseable {
             return;
         }
         try {
-            RelayController controller = network.connectToRelay(relayMultiaddr, internalHandler);
-            if (controllerRef.get() == null && controller != null) {
-                internalHandler.onConnected(extractRelayPeerId(relayMultiaddr), controller);
-            }
+            // InternalHandler.onConnected fires synchronously as part of this call returning
+            // (RelayProtocol doesn't hand back a controller until onActivated already ran) — it's
+            // what actually records the new controller and resets backoff state, so there's
+            // nothing left to do here on success.
+            network.connectToRelay(relayMultiaddr, internalHandler);
         } catch (Exception e) {
             System.err.println("[relay-session] connect attempt to " + relayMultiaddr + " failed: " + e);
             scheduleReconnect();
         }
-    }
-
-    private static PeerId extractRelayPeerId(String multiaddr) {
-        if (multiaddr == null) {
-            return null;
-        }
-        int index = multiaddr.lastIndexOf("/p2p/");
-        if (index == -1) {
-            return null;
-        }
-        return PeerId.of(multiaddr.substring(index + "/p2p/".length()));
     }
 
     private void scheduleReconnect() {
