@@ -183,6 +183,11 @@ public final class RelaySession implements AutoCloseable {
         return relayPeerId;
     }
 
+    /** Exposes the internal RelayEventHandler so host-level stream events route into this session. */
+    public RelayEventHandler eventHandler() {
+        return internalHandler;
+    }
+
     @Override
     public void close() {
         if (!closed.compareAndSet(false, true)) {
@@ -209,15 +214,38 @@ public final class RelaySession implements AutoCloseable {
             return;
         }
         try {
-            // InternalHandler.onConnected fires synchronously as part of this call returning
-            // (RelayProtocol doesn't hand back a controller until onActivated already ran) — it's
-            // what actually records the new controller and resets backoff state, so there's
-            // nothing left to do here on success.
-            network.connectToRelay(relayMultiaddr, internalHandler);
+            RelayController newController = network.connectToRelay(relayMultiaddr, internalHandler);
+            // A-1 hardware testing (2026-09-13): the relay's own registry logged both test peers
+            // registering -- proving the dial itself genuinely succeeds -- but neither peer's
+            // RelaySession ever recorded a controller, meaning InternalHandler.onConnected's
+            // previously-assumed-synchronous firing (see this class's prior Javadoc claim here)
+            // does not reliably happen for the dialing side in practice. M3a's
+            // RelayForwardMain/RelayRegisterMain -- the only previously hardware-verified callers
+            // of connectToRelay() -- never actually depended on that callback: both always used
+            // the *returned* RelayController directly as their source of truth. Doing the same
+            // here, instead of relying solely on the callback, closes that gap. Harmless if
+            // onConnected also fires on its own: same fields get set to the same values twice.
+            if (controllerRef.get() != newController) {
+                internalHandler.onConnected(extractRelayPeerId(), newController);
+            }
         } catch (Exception e) {
             System.err.println("[relay-session] connect attempt to " + relayMultiaddr + " failed: " + e);
             scheduleReconnect();
         }
+    }
+
+    /**
+     * The relay's own multiaddr already embeds its libp2p peer ID (the same string {@code
+     * PersistentRelayMain.extractPeerId} pulls out for display) -- used as the peer ID for {@link
+     * InternalHandler#onConnected} when this session sets the controller directly rather than
+     * waiting on {@code onActivated}'s callback to supply one via {@code stream.remotePeerId()}.
+     */
+    private PeerId extractRelayPeerId() {
+        int index = relayMultiaddr.lastIndexOf("/p2p/");
+        if (index == -1) {
+            throw new IllegalArgumentException("Relay address missing /p2p/<peer-id>: " + relayMultiaddr);
+        }
+        return PeerId.of(relayMultiaddr.substring(index + "/p2p/".length()));
     }
 
     private void scheduleReconnect() {

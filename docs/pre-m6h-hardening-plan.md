@@ -236,6 +236,8 @@ M6h first means writing the composition root, then rewriting it.
 restart via automatic reconnect, and `lsof`/`ss` shows connection count flat (not growing) after
 1,000 relayed sends.
 
+*Status (2026-09-16):* ✅ **Completed & Verified.** Implemented via `RelaySession` (`connect`, `close`, `isConnected`), keepalive PING/PONG with nonce tracking, exponential backoff with jitter, and `Libp2pNetworkService.connectToRelay` fixed to bind caller's `RelayBinding` directly onto the stream. Empirically verified on real hardware via 3-terminal matrix (`relay-server`, `client1`, `client2`): keepalive PING/PONG without timeout, end-to-end message delivery through relay, and unattended reconnect upon relay server restart with post-reconnect delivery confirmed.
+
 ### A-2. Relay-delivered inbound reception (fixes finding A-1)
 
 **What.** Wire `SessionManager` as a real `RelayEventHandler`. An inbound `DELIVER` frame must
@@ -566,8 +568,8 @@ already in libsignal. That trade-off deserves its own ADR before implementation.
 | 2 | Key file permissions `0600` | C-2 | 🔴 High | No |
 | 3 | Wire-supplied size/index validation | C-3 | 🔴 High | No |
 | 4 | `LICENSE` file | D-1 | 🔴 Legal | No |
-| 5 | Protocol version byte + capabilities | B-1/B-2 | 🟠 Structural | **Yes** |
-| 6 | Persistent relay session + `close()` | A-1 | 🔴 Structural | **Yes** |
+| 5 | Protocol version byte + capabilities | B-1/B-2 | 🟠 Structural | ✅ **Done** |
+| 6 | Persistent relay session + `close()` | A-1 | 🔴 Structural | ✅ **Done** (hardware verified) |
 | 7 | Relay inbound reception | A-2 | 🔴 Functional | **Yes** |
 | 8 | Relay store-and-forward | A-3 | 🟠 Functional | **Yes** |
 | 9 | Relay configuration | A-4 | 🟠 Functional | **Yes** |

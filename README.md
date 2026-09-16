@@ -1020,11 +1020,28 @@ Per the hardening audit's own sequencing: done ahead of Track A (relay-as-real-t
 
 ---
 
+## Track A-1 — Persistent relay session 🧪 Tested (hardware run) (see [`docs/verification-vocabulary.md`](docs/verification-vocabulary.md)) — real, executed `./gradlew test --rerun-tasks`, 401/401 tests passing across 59 executed tasks, 0 failures, 0 errors, plus 3-terminal matrix verified on Windows hardware
+
+Follows Track B per the hardening plan (`docs/pre-m6h-hardening-plan.md`), migrating the relay from a one-shot per-send dial to a long-lived, persistent connection with automatic reconnect and keepalive.
+
+- **RelaySession lifecycle (`connect`, `close`, `isConnected`):** Replaces per-send dialing in `ConnectionStrategy` with a persistent session owned by the daemon. Implements exponential backoff reconnect with jitter (up to 30s cap) and application-level `PING`/`PONG` keepalive ticks (60s tick, 10s timeout) tracking nonces.
+- **Root-cause fix in `Libp2pNetworkService.connectToRelay`:** Previously, `connectToRelay` dialed the host with `new RelayBinding(onEvent).dial(host, address)`. In `jvm-libp2p`, `HostImpl.newStream()` looks up protocols in the host's registered handlers rather than using the dialer's binding, causing inbound `PONG` and `DELIVER` frames to route to the host's default dummy handler, which silently discarded them and caused keepalive timeouts after 10 seconds. Fixed by directly creating the stream on the connection using the caller's specific `RelayBinding(onEvent)` via `conn.muxerSession().createStream(...)`, while exposing `RelaySession.eventHandler()` for defense-in-depth on host-level stream events.
+- **Demo & Verification (`PersistentRelayMain`):** Added a dedicated 3-terminal hardware testing entrypoint running against `relay-server`.
+- **Hardware verification (3-terminal test matrix):**
+  1. *Relay Server (`relay-server`)*: Listening on port 9100.
+  2. *Client 1 (`client1`)*: Persistent session connected, holding connection open.
+  3. *Client 2 (`client2`)*: Connected and forwarded message through relay; Client 1 received and logged delivery end-to-end.
+  4. *Keepalive verification*: PING sent at 60s idle tick, server echoed PONG, client cleared outstanding nonce within milliseconds; 0 disconnects across multiple tick cycles.
+  5. *Unattended reconnect verification*: Relay server process was terminated; both clients observed disconnect and entered backoff retries. Relay server restarted; both clients reconnected unattended, and subsequent messages forwarded through the reconnected session cleanly.
+- **Arithmetic:** 18 new unit tests added (13 in `RelaySessionTest`, 2 in `RelayFrameCodecTest`, 3 in `RelayRegistryTest`) over the 383-test M6g-6 baseline: 383 + 18 = 401 tests passing, 0 failures, 0 errors.
+
+---
+
 ## Next milestone
 
 M5a through M5e now cover the clock, the wire format, the live send/receive/persist loop, dedup/receipt state, and a pre-M6 hardening pass — all confirmed on real hardware, not just compiled. **M6 — the daemon + JSON-RPC/WebSocket API** is now underway, broken into sub-milestones following the same discipline M2–M5 used. M6a (shared dispatch), M6b (outbound send path), M6c (JSON value model), M6d (WebSocket transport), M6e-1 (persistent Signal session store — 39/39 tests), M6e-2 (`SessionManager`, the daemon core), and M6f (signed discovery records — 19/19 checks) are all done and verified.
 
-**All four M6g sub-milestones are complete and verified, plus a hardening pass on top:**
+**All four M6g sub-milestones are complete and verified, plus hardening passes on top:**
 
 - **M6g-1** ✅ — `StorageService` read-side expansion (`listConversations`, `listContacts`, `getConversation`, `getContact`), plus an HLC clock-drift regression fix found during review (see that section above).
 - **M6g-2** ✅ — Peer routing table (`PeerRoutingTable` + `V004__peer_routes.sql`), invite code format and `InviteCodeCodec`, `ContactService` orchestrating the `contacts.add` flow via signed discovery lookups.
@@ -1032,5 +1049,6 @@ M5a through M5e now cover the clock, the wire format, the live send/receive/pers
 - **M6g-4** ✅ — JSON-RPC router (`JsonRpcRouter`), method dispatch against all 13 of §7's named methods, push events extended to all five `DaemonEventListener` callbacks (not just §7's three named examples), and the `DaemonErrorCode` enum. Found and fixed two real gaps in `SessionManager` along the way (`sendChatMessage`/`sendFile` returning `ChatSendResult`/`FileSendResult`) and two testability constraints (`EventBroadcaster` and package-private `handle(text)` seam). Verified via full `./gradlew test` (39/39 tasks green repository-wide).
 - **M6g-5** 🧪 — Pre-M6h hardening pass (see above). All four 🔴 findings from the audit fixed; real, executed `./gradlew test --rerun-tasks` — 368/368, 0 failures, 0 errors, run on real hardware outside the environment this was implemented in. One real bug found by that run (an AssertJ `Path` canonicalization quirk in test code, not a production bug) fixed and folded back in. Not yet the two-real-process hardware checkpoint the project reserves for network-facing work (see the C-1 note above) — that's still ahead, likely alongside or after M6h.
 - **M6g-6** 🧪 — Track B: protocol versioning (see above). B-1 (version byte, all four codecs), B-2 (capability negotiation handshake, wired into `SessionManager`), B-3 (compatibility-policy ADR, which itself surfaced a real gap between policy and `ApplicationMessageRouter`'s current behavior — tracked in the ADR, not yet fixed). Real, executed `./gradlew test --rerun-tasks` — 383/383 tests passing across all subprojects, 0 failures, 0 errors.
+- **Track A-1** 🧪 — Persistent relay session (see above). `RelaySession`, keepalive PING/PONG, exponential backoff with jitter, `Libp2pNetworkService.connectToRelay` stream-binding bugfix. Real, executed `./gradlew test --rerun-tasks` — 401/401 tests passing, 0 failures, 0 errors, plus verified on real hardware via 3-terminal test matrix (`relay-server`, `client1`, `client2`).
 
-Then **M6h** (`DaemonMain`, the composition root + E2E test) picks up the remaining deferred items: relay-delivered inbound reception, pre-key bundle refresh cadence, the file-transfer completion receipt and locally-detected-send-failure push notification (both named above), and the live two-daemon-plus-JSON-RPC integration test. Real external/public address discovery also remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. Track A (relay as a real persistent transport, from the same hardening audit) remains, deliberately sequenced before M6h itself, now that Track B is done — see `docs/pre-m6h-hardening-plan.md`.
+Then **Track A-2** (relay-delivered inbound reception into `SessionManager`'s decrypt/dispatch pipeline) and **Track A-3** (relay store-and-forward spool) precede **M6h** (`DaemonMain`, the composition root + E2E test). Real external/public address discovery remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. See `docs/pre-m6h-hardening-plan.md`.

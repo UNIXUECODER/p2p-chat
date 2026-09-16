@@ -1,12 +1,15 @@
 package com.p2pchat.network;
 
+import io.libp2p.core.Connection;
 import io.libp2p.core.Host;
+import io.libp2p.core.StreamPromise;
 import io.libp2p.core.dsl.HostBuilder;
 import io.libp2p.core.multiformats.Multiaddr;
 import io.libp2p.crypto.keys.Ed25519Kt;
 import io.libp2p.protocol.Ping;
 import io.libp2p.protocol.PingController;
 
+import java.util.Collections;
 import java.util.concurrent.TimeUnit;
 
 public class Libp2pNetworkService implements PeerNetworkService {
@@ -93,7 +96,16 @@ public class Libp2pNetworkService implements PeerNetworkService {
     @Override
     public RelayController connectToRelay(String relayMultiaddrString, RelayEventHandler onEvent) throws Exception {
         Multiaddr address = Multiaddr.fromString(relayMultiaddrString);
-        return new RelayBinding(onEvent).dial(host, address).getController().get();
+        io.libp2p.core.PeerId peerId = address.getPeerId();
+        if (peerId == null) {
+            throw new IllegalArgumentException("Expected remote peer ID in the dial Multiaddr: " + relayMultiaddrString);
+        }
+        Connection conn = host.getNetwork().connect(peerId, address).get();
+        RelayBinding binding = new RelayBinding(onEvent);
+        StreamPromise<RelayController> promise = conn.muxerSession().createStream(
+                Collections.singletonList(binding.toInitiator(binding.getProtocolDescriptor().getAnnounceProtocols()))
+        );
+        return promise.getController().get();
     }
 
     @Override
