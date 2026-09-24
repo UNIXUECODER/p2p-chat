@@ -1050,5 +1050,25 @@ M5a through M5e now cover the clock, the wire format, the live send/receive/pers
 - **M6g-5** 🧪 — Pre-M6h hardening pass (see above). All four 🔴 findings from the audit fixed; real, executed `./gradlew test --rerun-tasks` — 368/368, 0 failures, 0 errors, run on real hardware outside the environment this was implemented in. One real bug found by that run (an AssertJ `Path` canonicalization quirk in test code, not a production bug) fixed and folded back in. Not yet the two-real-process hardware checkpoint the project reserves for network-facing work (see the C-1 note above) — that's still ahead, likely alongside or after M6h.
 - **M6g-6** 🧪 — Track B: protocol versioning (see above). B-1 (version byte, all four codecs), B-2 (capability negotiation handshake, wired into `SessionManager`), B-3 (compatibility-policy ADR, which itself surfaced a real gap between policy and `ApplicationMessageRouter`'s current behavior — tracked in the ADR, not yet fixed). Real, executed `./gradlew test --rerun-tasks` — 383/383 tests passing across all subprojects, 0 failures, 0 errors.
 - **Track A-1** 🧪 — Persistent relay session (see above). `RelaySession`, keepalive PING/PONG, exponential backoff with jitter, `Libp2pNetworkService.connectToRelay` stream-binding bugfix. Real, executed `./gradlew test --rerun-tasks` — 401/401 tests passing, 0 failures, 0 errors, plus verified on real hardware via 3-terminal test matrix (`relay-server`, `client1`, `client2`).
+- **Track A-2** 🧪 — Relay inbound reception & ADR-0001 unknown marker compliance (see above). `handleRelayDeliveredFrame`, `DispatchedMessage.Unknown` (ignore & log), 3-terminal hardware verification with NAT simulation. Real, executed `./gradlew test --rerun-tasks` — 403/403 tests passing across all subprojects, 0 failures, 0 errors.
 
-Then **Track A-2** (relay-delivered inbound reception into `SessionManager`'s decrypt/dispatch pipeline) and **Track A-3** (relay store-and-forward spool) precede **M6h** (`DaemonMain`, the composition root + E2E test). Real external/public address discovery remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. See `docs/pre-m6h-hardening-plan.md`.
+---
+
+## Track A-2 — Relay inbound reception & ADR-0001 unknown marker compliance 🧪 Tested (hardware run) (see [`docs/verification-vocabulary.md`](docs/verification-vocabulary.md)) — real, executed `./gradlew test --rerun-tasks`, 403/403 tests passing across 49 executed tasks, 0 failures, 0 errors, plus verified on real hardware via 3-terminal test matrix
+
+Resolves audit finding A-2 (and ADR-0001 follow-up) from `docs/pre-m6h-hardening-plan.md`, completing the inbound reception half of the persistent relay transport.
+
+- **`SessionManager.handleRelayDeliveredFrame`:** Wires incoming `DELIVER` frames from `RelaySession` directly into the daemon's decryption and dispatch pipeline. Uses `frame.peerId()` (the original sender embedded by the relay) rather than the relay stream's connection peer ID, ensuring correct Signal session lookup and delivery receipt attribution.
+- **ADR-0001 category 1 compliance (`ApplicationMessageRouter`):** Resolves the tracked follow-up from M6g-6: unknown application message markers now decode to `DispatchedMessage.Unknown` (logged and ignored), conforming to `docs/adr/0001-wire-protocol-compatibility-policy.md` rather than throwing an unhandled exception.
+- **Hardware verification (3-terminal test matrix):**
+  1. *Relay Server (`relay-server`)*: Listening on port 9100.
+  2. *Bob (`SessionManagerListenerMain`)*: Listening on port 9300, connected to relay.
+  3. *Alice (`SessionManagerSenderMain`)*: Direct port to Bob set to unreachable (port 59999) to simulate NAT blocking. Alice sends initial message; direct attempt fails, falls back to relay (`Send resolved: RELAYED`). Relay forwards Handshake (`1866 bytes`) and PQXDH PreKey message (`2139 bytes`). Bob receives via relay, decrypts, persists, and returns delivery receipt. Alice receives receipt via relay and transitions message to `DELIVERED`.
+  4. *Double Ratchet Step over Relay*: Alice sends second message (`491 bytes`) without PreKey bundle. Successfully ratcheted, relayed, delivered, and acknowledged end-to-end. Both SQLite databases verified on disk.
+- **Arithmetic:** 2 new unit tests in `SessionManagerRelayInboundTest` over the 401-test Track A-1 baseline: 401 + 2 = 403 tests passing, 0 failures, 0 errors.
+
+---
+
+## Next milestone
+
+Then **Track A-3** (relay store-and-forward spool) and **Track A-4** (relay configuration) precede **M6h** (`DaemonMain`, the composition root + E2E test). Real external/public address discovery remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. See `docs/pre-m6h-hardening-plan.md`.

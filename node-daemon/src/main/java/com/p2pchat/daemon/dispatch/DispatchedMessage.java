@@ -57,4 +57,20 @@ public sealed interface DispatchedMessage {
      */
     record Handshake(HandshakeWireMessage message) implements DispatchedMessage {
     }
+
+    /**
+     * docs/adr/0001 category 1 ("ignore and log"): a marker byte this build recognizes as
+     * reserved-for-later ({@code GROUP_OP}, {@code PRESENCE_PING}) or simply doesn't recognize at
+     * all. Deliberately not an exception — see the ADR's own reasoning for why a mixed-version
+     * network must tolerate this as a permanent, expected steady state rather than an error.
+     *
+     * <p>Carries the raw marker so a caller can log something more useful than "an unknown
+     * message arrived." {@code int}, not {@code byte} — {@link ApplicationMessageRouter} widens
+     * it unsigned before constructing this, so a marker of 200 logs as {@code 200}, not the
+     * {@code -56} Java's signed {@code byte} would otherwise print.
+     *
+     * @param marker the unrecognized (or reserved-but-unimplemented) marker byte, unsigned-widened
+     */
+    record Unknown(int marker) implements DispatchedMessage {
+    }
 }

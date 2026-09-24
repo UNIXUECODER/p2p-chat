@@ -16,8 +16,10 @@ import com.p2pchat.messaging.wire.HandshakeMessageCodec;
  * EnvelopeType} enum already assigned, and the two ranges are already disjoint — neither codec
  * had to change for this router to exist. Routing is a single-byte peek, not a new wire format.
  *
- * <p><b>Markers 0, 1, 5, 9 are reserved, not unknown</b> — see the per-marker messages below for
- * why each is still unimplemented, which is not the same thing as malformed. In particular,
+ * <p><b>Markers 0, 1, 5, 9 are reserved, not unknown</b> — see the switch below and
+ * docs/adr/0001 for why 5 (GROUP_OP) and 9 (PRESENCE_PING) are still unimplemented (resolving to
+ * {@link DispatchedMessage.Unknown}, not an error) and why "unimplemented" is not the same thing
+ * as malformed. In particular,
  * marker 0/1 (HANDSHAKE_INIT/HANDSHAKE_RESPONSE) are unlikely to ever need a codec at this layer
  * at all: PQXDH session establishment already happens transparently inside {@code
  * SecureSessionService.decrypt(...)}, via libsignal's own PreKeySignalMessage/SignalMessage
@@ -59,9 +61,11 @@ public final class ApplicationMessageRouter {
      *                   full array (marker included) is forwarded to whichever codec handles it,
      *                   since both codecs' own {@code decode()} methods expect the marker still
      *                   present at index 0.
-     * @throws IllegalArgumentException if {@code plaintext} is null, empty, carries a reserved-
-     *         but-unimplemented marker, an unrecognized marker, or fails either codec's own
-     *         internal validation (malformed length-prefixed fields, truncated payload, etc.).
+     * @throws IllegalArgumentException if {@code plaintext} is null, empty, or fails a
+     *         recognized marker's own codec validation (malformed length-prefixed fields,
+     *         truncated payload, etc.). A reserved-but-unimplemented or genuinely unrecognized
+     *         marker no longer throws — see {@link DispatchedMessage.Unknown} and docs/adr/0001
+     *         category 1.
      */
     public static DispatchedMessage dispatch(byte[] plaintext) {
         if (plaintext == null || plaintext.length < 1) {
@@ -76,12 +80,15 @@ public final class ApplicationMessageRouter {
                     new DispatchedMessage.FileTransfer(FileTransferMessageCodec.decode(plaintext));
             case HANDSHAKE_INIT, HANDSHAKE_RESPONSE ->
                     new DispatchedMessage.Handshake(HandshakeMessageCodec.decode(plaintext));
-            case GROUP_OP -> throw new IllegalArgumentException(
-                    "Marker 5 (GROUP_OP) is reserved for group chat (M8) and has no codec yet");
-            case PRESENCE_PING -> throw new IllegalArgumentException(
-                    "Marker 9 (PRESENCE_PING) is reserved and has no codec yet");
-            default -> throw new IllegalArgumentException(
-                    "Unknown application message marker: " + marker + " \u2014 malformed or corrupt payload");
+            // docs/adr/0001 category 1 ("ignore and log"): GROUP_OP/PRESENCE_PING are reserved
+            // for M8/presence but not implemented yet, and any other value is a marker this
+            // build has simply never heard of -- neither is malformed data, both are the
+            // expected, permanent steady state of a mixed-version network the ADR describes.
+            // A genuinely corrupt payload still throws, from the codecs' own decode() calls
+            // above -- a marker says nothing about whether the bytes after it are well-formed,
+            // so there's no format to validate an unrecognized marker's payload against here.
+            case GROUP_OP, PRESENCE_PING -> new DispatchedMessage.Unknown(Byte.toUnsignedInt(marker));
+            default -> new DispatchedMessage.Unknown(Byte.toUnsignedInt(marker));
         };
     }
 }

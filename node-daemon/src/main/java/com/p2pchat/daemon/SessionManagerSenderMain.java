@@ -72,7 +72,8 @@ public class SessionManagerSenderMain {
         String bundleFilePath = args[1];
         String messageText = args[2];
         int port = args.length > 3 ? Integer.parseInt(args[3]) : 9301;
-        String filePath = args.length > 4 ? args[4] : null;
+        String filePath = args.length > 4 && !args[4].isBlank() && !args[4].equalsIgnoreCase("none") ? args[4] : null;
+        String relayMultiaddr = args.length > 5 && !args[5].isBlank() ? args[5] : null;
 
         Path baseDir = Path.of(System.getProperty("user.dir"), System.getProperty("p2pchat.dataDir", ".p2p-chat-data"));
 
@@ -104,7 +105,7 @@ public class SessionManagerSenderMain {
         SessionManager sessionManager =
                 new SessionManager(network, storage, synchronizedStore, fileTransferHandler, eventListener);
         eventListener.attachSessionManager(sessionManager);
-        sessionManager.start(port, identityService.rawPrivateKeySeed());
+        sessionManager.start(port, identityService.rawPrivateKeySeed(), relayMultiaddr);
         Runtime.getRuntime().addShutdownHook(new Thread(sessionManager::close));
 
         String remotePeerIdValue = listenerAddress.substring(listenerAddress.lastIndexOf("/p2p/") + "/p2p/".length());
@@ -122,12 +123,12 @@ public class SessionManagerSenderMain {
         // M6g-4: sendChatMessage now returns a ChatSendResult (messageId + status), not a bare
         // ConnectivityStatus -- see that class's own Javadoc for why.
         ChatSendResult chatResult = sessionManager
-                .sendChatMessage(remotePeerId, listenerAddress, null, bundle, conversationId, messageText)
+                .sendChatMessage(remotePeerId, listenerAddress, relayMultiaddr, bundle, conversationId, messageText)
                 .join();
 
         System.out.println("Send resolved: " + chatResult.status() + " (messageId=" + chatResult.messageId() + ")");
-        System.out.println("Waiting up to 5s for the delivery receipt to arrive back...");
-        Thread.sleep(5000);
+        System.out.println("Waiting up to 12s for the delivery receipt to arrive back...");
+        Thread.sleep(12000);
         System.out.println("Done -- check this process's SQLite database for the message's final delivery_state.");
 
         if (filePath != null) {
@@ -139,7 +140,7 @@ public class SessionManagerSenderMain {
             // this "only spend a one-time prekey if a session doesn't already exist" gate.
             // M6g-4: sendFile now returns a FileSendResult (transferId + status), not a bare
             // ConnectivityStatus -- see that class's own Javadoc for why.
-            var fileResult = sessionManager.sendFile(remotePeerId, listenerAddress, null, fileToSend).join();
+            var fileResult = sessionManager.sendFile(remotePeerId, listenerAddress, relayMultiaddr, fileToSend).join();
             System.out.println("File offer send resolved: " + fileResult.status() + " (transferId=" + fileResult.transferId() + ")");
             System.out.println("Waiting up to 15s for chunk request/response and completion to finish...");
             Thread.sleep(15000);

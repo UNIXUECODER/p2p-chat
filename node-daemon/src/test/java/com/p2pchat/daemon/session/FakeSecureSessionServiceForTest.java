@@ -10,12 +10,20 @@ import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 /**
- * A minimal {@link SecureSessionService} double — only {@link #encrypt} needs to actually work,
- * since {@link SessionManager#handleDecryptedPlaintext} (called directly by the test) reaches it
- * only via the auto-delivery-receipt path. Not testing encryption correctness here at all — that
- * is {@code LibsignalSecureSessionServiceTest}'s job, already covered; this exists purely so the
- * receive pipeline's dispatch/dedup/persistence logic can be exercised without needing real
- * libsignal-client cryptography to do it.
+ * A minimal {@link SecureSessionService} double — not testing encryption correctness here at
+ * all, that is {@code LibsignalSecureSessionServiceTest}'s job, already covered; this exists
+ * purely so the receive pipeline's dispatch/dedup/persistence logic can be exercised without
+ * needing real libsignal-client cryptography to do it.
+ *
+ * <p><b>A-2 update: {@link #decrypt} is now a real (if trivial) no-op, not a throw.</b>
+ * Previously only {@link #encrypt} needed to work, since {@code
+ * SessionManagerReceivePipelineTest} calls {@code handleDecryptedPlaintext} directly, bypassing
+ * decryption entirely. {@code SessionManagerRelayInboundTest} goes in through {@code
+ * handleInboundEnvelope} instead (the whole point of what it's proving — see that class's own
+ * Javadoc), which genuinely calls {@code decrypt} first. Symmetric with {@link #encrypt}'s own
+ * no-op transformation — {@code encrypt(plaintext)} wraps it in a non-PreKey {@code
+ * EncryptedFrame} unchanged, so {@code decrypt(frame)} unwrapping it via {@code
+ * frame.ciphertext()} is the correct inverse, not an arbitrary stand-in.
  */
 final class FakeSecureSessionServiceForTest implements SecureSessionService {
 
@@ -38,6 +46,6 @@ final class FakeSecureSessionServiceForTest implements SecureSessionService {
 
     @Override
     public byte[] decrypt(SignalProtocolAddress remote, EncryptedFrame frame) {
-        throw new UnsupportedOperationException("not exercised by the receive-pipeline test");
+        return frame.ciphertext();
     }
 }

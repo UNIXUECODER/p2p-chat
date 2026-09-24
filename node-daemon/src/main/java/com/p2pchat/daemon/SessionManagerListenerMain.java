@@ -67,6 +67,7 @@ public class SessionManagerListenerMain {
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : 9300;
+        String relayMultiaddr = args.length > 1 && !args[1].isBlank() ? args[1] : null;
 
         Path baseDir = Path.of(System.getProperty("user.dir"), System.getProperty("p2pchat.dataDir", ".p2p-chat-data"));
 
@@ -104,9 +105,12 @@ public class SessionManagerListenerMain {
         // Must happen before start() -- see PrintingDaemonEventListener's own Javadoc on why
         // this ordering is a real requirement, not just tidiness.
         eventListener.attachSessionManager(sessionManager);
-        sessionManager.start(port, identityService.rawPrivateKeySeed());
+        sessionManager.start(port, identityService.rawPrivateKeySeed(), relayMultiaddr);
 
         System.out.println("Listening on port " + port + ", peer id " + sessionManager.localPeerId().value());
+        if (relayMultiaddr != null) {
+            System.out.println("Connected to relay: " + relayMultiaddr);
+        }
         System.out.println("Bundle published to " + bundleFile.toAbsolutePath());
         System.out.println("Incoming files will be auto-accepted and saved under " + downloadDir.toAbsolutePath());
         System.out.println("Run SessionManagerSenderMain against this process as many times, from as many");

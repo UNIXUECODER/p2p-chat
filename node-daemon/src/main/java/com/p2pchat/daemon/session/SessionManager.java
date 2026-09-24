@@ -31,6 +31,10 @@ import com.p2pchat.network.ConnectionStrategy;
 import com.p2pchat.network.ConnectivityStatus;
 import com.p2pchat.network.DialableAddressResolver;
 import com.p2pchat.network.PeerNetworkService;
+import com.p2pchat.network.RelayController;
+import com.p2pchat.network.RelayEventHandler;
+import com.p2pchat.network.RelayFrame;
+import com.p2pchat.network.RelayFrameType;
 import com.p2pchat.network.RelaySession;
 import com.p2pchat.storage.StorageService;
 import com.p2pchat.storage.model.Conversation;
@@ -72,15 +76,30 @@ import java.util.concurrent.Executors;
  *   on that side — confirmed by re-reading {@code LibsignalSecureSessionService}'s real,
  *   unmodified contract before assuming it, not taken on faith), so nothing here depends on
  *   discovery (M6f) or an RPC surface (M6g) existing yet.</li>
- *   <li><b>Explicitly deferred, not silently skipped:</b> relay-delivered <i>inbound</i>
- *   reception. pre-m6h-hardening-plan.md's Track A / A-1 (a persistent, reconnecting, keepalive-
- *   monitored {@link RelaySession}, wired in via the 3-arg {@link #start} overload) is done — but
- *   {@link #handleInboundEnvelope} is still only ever registered as {@code OnEnvelopeMessage},
- *   never as the session's {@code downstreamHandler}, so a message actually delivered *through*
- *   the relay still never reaches this class's decrypt/dispatch pipeline. That wiring, plus the
- *   hardcoded {@code null} relay address in {@link #handleChatMessagePayload}'s delivery-receipt
- *   reply, is A-2's job specifically, not this one's — named here so it stays a tracked gap, not
- *   a silent one now that A-1 might otherwise look like the whole story.</li>
+ *   <li><b>A-2 (pre-m6h-hardening-plan.md, Track A) is done as of this update.</b> The persistent
+ *   {@link RelaySession} A-1 built now has a real {@code downstreamHandler} — see {@link
+ *   #handleRelayDeliveredFrame} — wired to the exact same decrypt/dispatch pipeline {@link
+ *   #handleInboundEnvelope} already gives a directly-received envelope. One correctness detail
+ *   worth recording precisely, since it is exactly the kind of thing that's easy to get wrong
+ *   wiring two already-proven components together: {@code RelayProtocol.Handler.onMessage}
+ *   always passes the RELAY's own {@code stream.remotePeerId()} as {@code onFrame}'s sender
+ *   parameter (confirmed by reading it directly, not assumed) — the true original sender for a
+ *   {@code DELIVER} frame is the completely different {@link RelayFrame#peerId()} field. {@link
+ *   #handleRelayDeliveredFrame}'s signature takes only the {@link RelayFrame} itself, deliberately,
+ *   so a wiring mistake that reached for the wrong identity is unrepresentable at this seam, not
+ *   just avoided by convention — see that method's own Javadoc.
+ *   <p>The delivery-receipt reply {@link #handleChatMessagePayload} sends turned out not to need
+ *   a change: it already passes {@code relayMultiaddr = null} to {@code outbound.send(...)},
+ *   which looks, at a glance, like the "hardcoded null relay address" gap pre-m6h-hardening-
+ *   plan.md originally named for A-2 — but tracing {@link ConnectionStrategy} precisely (not
+ *   assuming) shows it resolves its relay leg from its own {@code relaySession} field once one is
+ *   configured, never from that per-call parameter (see that class's own Javadoc). The reply
+ *   already falls through to the persistent relay session correctly once a direct attempt to the
+ *   sender's self-reported address fails or times out. Real, if minor, cost worth naming rather
+ *   than leaving implicit: that direct attempt is not skipped just because a message is known to
+ *   have just arrived via relay, so a reply to a relay-only peer waits out the full 5s {@code
+ *   directTimeoutMillis} every time before succeeding over relay — a latency optimization left
+ *   for later, not a correctness gap.</li>
  *   <li><b>M6g-3 update:</b> the file-transfer chunk state machine {@code
  *   FileReceiverMain}/{@code FileSenderMain} (M4c/M4d) proved is no longer deferred — {@link
  *   DefaultFileTransferHandler} is a real {@link FileTransferHandler} implementation, and
@@ -242,9 +261,10 @@ public final class SessionManager implements AutoCloseable {
      * ConnectionStrategy} dialing (and leaking) a fresh relay connection per send. Pass {@code
      * null} or blank for no relay at all, equivalent to calling the 2-arg overload.
      *
-     * <p>Does not, by itself, make relay-<i>received</i> messages reach this class's dispatch
-     * pipeline — see this class's own Javadoc, "Explicitly deferred" note, for why that's A-2's
-     * job, not this constructor parameter's.
+     * <p>A-2 update: relay-<i>received</i> messages now reach this class's decrypt/dispatch
+     * pipeline too, not just outbound sends — see {@link #handleRelayDeliveredFrame} and this
+     * class's own top Javadoc for the full reasoning. This overload is what wires that in; the
+     * 2-arg overload has no relay at all, so there is nothing for it to receive from one.
      */
     public void start(int listenPort, byte[] identityKeySeed, String relayMultiaddr) {
         network.start(listenPort, identityKeySeed, this::handleInboundEnvelope);
@@ -256,7 +276,31 @@ public final class SessionManager implements AutoCloseable {
         this.sessions = new LibsignalSecureSessionService(signalStore, new SignalProtocolAddress(ownPeerIdValue, 1));
 
         if (relayMultiaddr != null && !relayMultiaddr.isBlank()) {
-            this.relaySession = new RelaySession(network, relayMultiaddr, null, () -> emit(listener::onNetworkStatusChanged));
+            // A-2: the actual sender for a DELIVER frame is frame.peerId(), never the peerId
+            // parameter RelayEventHandler.onFrame receives -- see handleRelayDeliveredFrame's own
+            // Javadoc for why (confirmed against RelayProtocol.Handler.onMessage directly). That
+            // parameter is deliberately unused here, not forwarded, so this seam can't reintroduce
+            // the mistake later.
+            RelayEventHandler relayDownstreamHandler = new RelayEventHandler() {
+                @Override
+                public void onConnected(PeerId peerId, RelayController controller) {
+                    // No-op: RelaySession's own InternalHandler already captures the controller
+                    // and drives reconnect bookkeeping. This seam only needs inbound application
+                    // frames -- see onFrame below.
+                }
+
+                @Override
+                public void onFrame(PeerId relayPeerId, RelayFrame frame) {
+                    handleRelayDeliveredFrame(frame);
+                }
+
+                @Override
+                public void onDisconnected(PeerId peerId, RelayController controller) {
+                    // No-op, same reasoning as onConnected.
+                }
+            };
+            this.relaySession = new RelaySession(network, relayMultiaddr, relayDownstreamHandler,
+                    () -> emit(listener::onNetworkStatusChanged));
             this.relaySession.connect();
             this.connectionStrategy = new ConnectionStrategy(network, 5_000, relaySession);
         } else {
@@ -471,9 +515,15 @@ public final class SessionManager implements AutoCloseable {
                 // session establishment for a peer's first PreKey message happens transparently
                 // INSIDE decrypt() (see class Javadoc), invisible to this caller unless it
                 // compares before/after itself. This is that comparison.
-                boolean hadSessionBefore = signalStore.containsSession(remote);
+                //
+                // signalStore is only ever null in a test double that deliberately bypasses real Signal
+                // session tracking (see SessionManagerRelayInboundTest / SessionManagerReceivePipelineTest);
+                // every real entry point (SessionManagerListenerMain, SessionManagerSenderMain, the eventual
+                // DaemonMain) always constructs a real SqliteSignalProtocolStore. Null-safe here purely so
+                // those tests don't need a full SignalProtocolStore fake to exercise this seam.
+                boolean hadSessionBefore = signalStore != null && signalStore.containsSession(remote);
                 byte[] plaintext = sessions.decrypt(remote, frame);
-                if (!hadSessionBefore) {
+                if (signalStore != null && !hadSessionBefore) {
                     emit(listener::onNetworkStatusChanged);
                 }
                 handleDecryptedPlaintext(sender, plaintext);
@@ -500,7 +550,41 @@ public final class SessionManager implements AutoCloseable {
             case DispatchedMessage.Chat chat -> handleChatMessage(sender, chat.message());
             case DispatchedMessage.FileTransfer file -> handleFileTransferMessage(sender, file.message());
             case DispatchedMessage.Handshake handshake -> handleHandshakeMessage(sender, handshake.message());
+            case DispatchedMessage.Unknown unknown -> System.out.println(
+                    "[session-manager] ignoring reserved/unrecognized application message marker "
+                            + unknown.marker() + " from " + sender + " (docs/adr/0001 category 1: \"ignore and log\")");
         }
+    }
+
+    /**
+     * A-2 (pre-m6h-hardening-plan.md, Track A): the relay-delivered half of this class's inbound
+     * pipeline — {@link #handleInboundEnvelope}'s counterpart for a message that arrived via the
+     * persistent {@link RelaySession} A-1 built, rather than a direct connection. Package-private
+     * so a test can call it directly with a hand-built {@link RelayFrame}, the same "prove the
+     * seam in isolation" approach {@link #handleDecryptedPlaintext} already established for the
+     * decrypt-independent half of this pipeline.
+     *
+     * <p><b>Reads {@link RelayFrame#peerId()}, never a separate sender identity.</b> This method
+     * takes only the frame, deliberately — confirmed by reading {@code
+     * RelayProtocol.Handler.onMessage} directly, not assumed: the {@code peerId} parameter {@code
+     * RelayEventHandler.onFrame} receives is always {@code stream.remotePeerId()}, the identity of
+     * whoever is on the other end of the raw stream — for this daemon's own persistent connection
+     * to its relay, that's the RELAY's peer id, not whoever the relay is forwarding a message
+     * from. {@code frame.peerId()} is the field {@link RelayFrame}'s own Javadoc documents as
+     * carrying the true original sender for a {@code DELIVER} frame. Getting this backwards would
+     * silently attribute every relayed message to the relay's own identity instead of the real
+     * sender — wrong {@link SignalProtocolAddress}, a decrypt failure or worse, not a loud error.
+     *
+     * <p>Ignores anything that isn't a {@code DELIVER} frame: {@code FORWARD} is client-to-relay
+     * only and should never arrive here, and {@code PONG} never reaches this far in the first
+     * place — {@link RelaySession}'s own {@code InternalHandler} consumes it before this class's
+     * downstream handler is ever called.
+     */
+    void handleRelayDeliveredFrame(RelayFrame frame) {
+        if (frame.type() != RelayFrameType.DELIVER) {
+            return;
+        }
+        handleInboundEnvelope(PeerId.of(frame.peerId()), frame.payload());
     }
 
     /**

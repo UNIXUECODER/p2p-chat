@@ -186,26 +186,30 @@ class ApplicationMessageRouterTest {
         }
 
         @Test
-        void rejectsGroupOpAsNotYetImplemented() {
-            assertThatThrownBy(() -> ApplicationMessageRouter.dispatch(new byte[]{5, 0, 0, 0}))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("GROUP_OP")
-                    .hasMessageContaining("M8");
+        void treatsGroupOpAsIgnoredNotAnError() {
+            // docs/adr/0001 category 1: reserved-for-later, not implemented yet, "ignore and
+            // log" -- not an error. Regression test for the exact gap that ADR's own audit
+            // section named: this used to throw.
+            DispatchedMessage result = ApplicationMessageRouter.dispatch(new byte[]{5, 0, 0, 0});
+            assertThat(result).isInstanceOf(DispatchedMessage.Unknown.class);
+            assertThat(((DispatchedMessage.Unknown) result).marker()).isEqualTo(5);
         }
 
         @Test
-        void rejectsPresencePingAsNotYetImplemented() {
-            assertThatThrownBy(() -> ApplicationMessageRouter.dispatch(new byte[]{9, 0, 0, 0}))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("PRESENCE_PING");
+        void treatsPresencePingAsIgnoredNotAnError() {
+            DispatchedMessage result = ApplicationMessageRouter.dispatch(new byte[]{9, 0, 0, 0});
+            assertThat(result).isInstanceOf(DispatchedMessage.Unknown.class);
+            assertThat(((DispatchedMessage.Unknown) result).marker()).isEqualTo(9);
         }
 
         @ParameterizedTest
         @ValueSource(bytes = {10, 42, -1, -128})
-        void rejectsTrulyUnknownMarkers(byte marker) {
-            assertThatThrownBy(() -> ApplicationMessageRouter.dispatch(new byte[]{marker, 0, 0, 0}))
-                    .isInstanceOf(IllegalArgumentException.class)
-                    .hasMessageContaining("Unknown application message marker");
+        void treatsTrulyUnknownMarkersAsIgnoredNotAnError(byte marker) {
+            DispatchedMessage result = ApplicationMessageRouter.dispatch(new byte[]{marker, 0, 0, 0});
+            assertThat(result).isInstanceOf(DispatchedMessage.Unknown.class);
+            // Byte.toUnsignedInt -- see DispatchedMessage.Unknown's own Javadoc for why -1/-128
+            // (as a signed byte) must not surface as a negative marker number in a log line.
+            assertThat(((DispatchedMessage.Unknown) result).marker()).isEqualTo(Byte.toUnsignedInt(marker));
         }
 
         @Test

@@ -377,10 +377,12 @@ tasks.register<JavaExec>("runSessionManagerListener") {
     group = "p2p-chat"
     description = "M6e-2/M6g-3: multi-session daemon core, listener side -- now auto-accepts inbound file offers " +
             "and saves them under <datadir>/received-files (see PrintingDaemonEventListener). " +
-            "Optional: -Pport=9300 -Pdatadir=.p2p-chat-data"
+            "Optional: -Pport=9300 -Prelay=\"...\" -Pdatadir=.p2p-chat-data"
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.SessionManagerListenerMain")
-    args = listOf((project.findProperty("port") as String?) ?: "9300")
+    val portArg = (project.findProperty("port") as String?) ?: "9300"
+    val relayArg = (project.findProperty("relay") as String?) ?: ""
+    args = listOf(portArg, relayArg)
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }
 
@@ -388,20 +390,18 @@ tasks.register<JavaExec>("runSessionManagerSender") {
     group = "p2p-chat"
     description = "M6e-2/M6g-3: multi-session daemon core, sender side. Required: -Paddr=... -Pbundlefile=... -Pmessage=... " +
             "Optional: -Pport=9301 -Pdatadir=.p2p-chat-data -Pfile=\"<path>\" (also offers this file to the target " +
-            "via SessionManager.sendFile/DefaultFileTransferHandler, auto-accepted on the listener side -- M6g-3 checkpoint)"
+            "via SessionManager.sendFile/DefaultFileTransferHandler, auto-accepted on the listener side -- M6g-3 checkpoint) " +
+            "-Prelay=\"...\""
     classpath = sourceSets["main"].runtimeClasspath
     mainClass.set("com.p2pchat.daemon.SessionManagerSenderMain")
     val addrArg = project.findProperty("addr") as String?
     val bundlefileArg = project.findProperty("bundlefile") as String?
     val messageArg = project.findProperty("message") as String?
     val portArg = (project.findProperty("port") as String?) ?: "9301"
-    val fileArg = project.findProperty("file") as String?
+    val fileArg = (project.findProperty("file") as String?) ?: "none"
+    val relayArg = (project.findProperty("relay") as String?) ?: ""
     if (addrArg != null && bundlefileArg != null && messageArg != null) {
-        args = if (fileArg != null) {
-            listOf(addrArg, bundlefileArg, messageArg, portArg, fileArg)
-        } else {
-            listOf(addrArg, bundlefileArg, messageArg, portArg)
-        }
+        args = listOf(addrArg, bundlefileArg, messageArg, portArg, fileArg, relayArg)
     }
     systemProperty("p2pchat.dataDir", (project.findProperty("datadir") as String?) ?: ".p2p-chat-data")
 }

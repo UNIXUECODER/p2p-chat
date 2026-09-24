@@ -14,8 +14,13 @@
 > ADR surfaced a real gap between the policy it documents and `ApplicationMessageRouter`'s actual
 > behavior for unrecognized markers (throws; the policy says ignore+log) — recorded as a tracked
 > follow-up in the ADR itself, not fixed in the same pass, and not yet run on real hardware (see
-> the same README section for exactly what is and isn't confirmed). Track A remains, next, before
-> M6h.
+> the same README section for exactly what is and isn't confirmed).
+>
+> **Update (Track A-1 & A-2):** Track A-1 (persistent relay session, keepalive, exponential backoff)
+> and Track A-2 (relay inbound frame handling via `handleRelayDeliveredFrame`, ADR-0001 unknown
+> marker compliance) are both complete, unit-tested (403/403 tests passing repository-wide), and
+> verified on real hardware via 3-terminal test matrix (two NAT-simulated daemons exchanging messages
+> and delivery receipts over relay). Track A-3 (relay store-and-forward spool) is next.
 >
 > **Author:** Audit pass conducted against commit `3a14054` (M6g-4)
 > **Scope:** Everything that should be done *before* M6h (`DaemonMain`), and before M7 (UI).
@@ -570,7 +575,7 @@ already in libsignal. That trade-off deserves its own ADR before implementation.
 | 4 | `LICENSE` file | D-1 | 🔴 Legal | No |
 | 5 | Protocol version byte + capabilities | B-1/B-2 | 🟠 Structural | ✅ **Done** |
 | 6 | Persistent relay session + `close()` | A-1 | 🔴 Structural | ✅ **Done** (hardware verified) |
-| 7 | Relay inbound reception | A-2 | 🔴 Functional | **Yes** |
+| 7 | Relay inbound reception | A-2 | 🔴 Functional | ✅ **Done** (hardware verified) |
 | 8 | Relay store-and-forward | A-3 | 🟠 Functional | **Yes** |
 | 9 | Relay configuration | A-4 | 🟠 Functional | **Yes** |
 | 10 | Adversarial codec tests | C-5 | 🟠 High value | No |
