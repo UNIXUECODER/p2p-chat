@@ -16,40 +16,81 @@ import java.util.List;
  * already-migrated database is a no-op. Matches the naming convention
  * docs/architecture-spec.md §9 already specifies ("V001__init.sql, V002__...sql").
  *
- * <p>Migration scripts are classpath resources under {@code db/migration/}, listed explicitly
- * in {@link #MIGRATIONS} rather than discovered by scanning the classpath directory. Classpath
- * directory scanning behaves differently between Gradle's exploded classes directory (used by
- * {@code :run} / {@code JavaExec} tasks) and a packaged jar (used by {@code :installDist} /
- * {@code :distZip}), and getting that right for both without being able to run and verify it
- * here isn't worth the risk for a project that doesn't yet need migrations to be discovered
- * dynamically. Add new scripts to the end of the list as they're written; per §9, never
- * hand-edit a script once it has shipped — write a new one instead.
+ * <p>Migration scripts are classpath resources, listed explicitly rather than discovered by
+ * scanning the classpath directory. Classpath directory scanning behaves differently between
+ * Gradle's exploded classes directory (used by {@code :run} / {@code JavaExec} tasks) and a
+ * packaged jar (used by {@code :installDist} / {@code :distZip}), and getting that right for
+ * both without being able to run and verify it here isn't worth the risk for a project that
+ * doesn't yet need migrations to be discovered dynamically. Add new scripts to the end of the
+ * list as they're written; per §9, never hand-edit a script once it has shipped — write a new
+ * one instead.
+ *
+ * <p><b>Track A-3 (pre-m6h-hardening-plan.md):</b> the resource root and migration list are now
+ * constructor parameters, not hardcoded static fields — {@code relay-server}'s own spool schema
+ * needs this same version-tracked-apply-once machinery against a completely separate database
+ * file and a completely separate migration set, and duplicating this class's ~100 lines of
+ * transaction/rollback/bookkeeping logic to get it would be exactly the kind of drift this
+ * project avoids elsewhere. The no-arg constructor is unchanged in behavior — it delegates to
+ * this class's own original hardcoded root and list — so every existing caller ({@link
+ * SqliteDatabase}, this class's own tests) needed no changes at all.
  */
 public final class MigrationRunner {
 
-    private static final List<String> MIGRATIONS = List.of(
+    private static final List<String> DEFAULT_MIGRATIONS = List.of(
             "V001__init.sql",
             "V002__signal_store.sql",
             "V003__kyber_base_key_replay.sql",
             "V004__peer_routes.sql"
     );
 
-    private static final String RESOURCE_ROOT = "/db/migration/";
+    private static final String DEFAULT_RESOURCE_ROOT = "/db/migration/";
+
+    private final String resourceRoot;
+    private final List<String> migrations;
 
     /**
-     * Applies every migration in {@link #MIGRATIONS} that hasn't already been recorded in
-     * {@code schema_migrations}, in order, each in its own transaction.
+     * core-storage's own migration set, unchanged from before this class took constructor
+     * parameters — equivalent to {@code new MigrationRunner(DEFAULT_RESOURCE_ROOT,
+     * DEFAULT_MIGRATIONS)}.
+     */
+    public MigrationRunner() {
+        this(DEFAULT_RESOURCE_ROOT, DEFAULT_MIGRATIONS);
+    }
+
+    /**
+     * Track A-3: lets a caller outside core-storage (namely {@code relay-server}'s own spool)
+     * apply its own, entirely separate versioned migration set against its own database file,
+     * with its own independent {@code schema_migrations} bookkeeping table — reusing this
+     * class's transaction/rollback/apply-once logic rather than re-implementing it.
+     *
+     * @param resourceRoot classpath directory the migration scripts live under, trailing slash
+     *                     included (e.g. {@code "/db/relay-migration/"}) — kept as a full path
+     *                     rather than a bare directory name so it stays a direct, unambiguous
+     *                     match for {@link Class#getResourceAsStream(String)}'s own convention
+     * @param migrations   migration script filenames in application order, matching whatever
+     *                     naming convention the caller has chosen for its own scripts — this
+     *                     class only cares about applying them in list order and recording how
+     *                     many have been applied, never about the filenames' own content
+     */
+    public MigrationRunner(String resourceRoot, List<String> migrations) {
+        this.resourceRoot = resourceRoot;
+        this.migrations = List.copyOf(migrations);
+    }
+
+    /**
+     * Applies every migration in this instance's migration list that hasn't already been
+     * recorded in {@code schema_migrations}, in order, each in its own transaction.
      */
     public void migrate(Connection connection) throws SQLException {
         ensureMigrationsTable(connection);
         int currentVersion = currentVersion(connection);
 
-        for (int i = 0; i < MIGRATIONS.size(); i++) {
+        for (int i = 0; i < migrations.size(); i++) {
             int scriptVersion = i + 1;
             if (scriptVersion <= currentVersion) {
                 continue;
             }
-            applyMigration(connection, scriptVersion, MIGRATIONS.get(i));
+            applyMigration(connection, scriptVersion, migrations.get(i));
         }
     }
 
@@ -101,7 +142,7 @@ public final class MigrationRunner {
     }
 
     private String readResource(String resourceName) {
-        String path = RESOURCE_ROOT + resourceName;
+        String path = resourceRoot + resourceName;
         try (InputStream in = MigrationRunner.class.getResourceAsStream(path)) {
             if (in == null) {
                 throw new IllegalStateException("Migration resource not found on classpath: " + path);
