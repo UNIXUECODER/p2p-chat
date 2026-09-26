@@ -7,6 +7,11 @@ dependencies {
     implementation(project(":core-identity"))
     implementation(project(":core-model"))
     implementation(project(":core-network"))
+    // Track A-3 (pre-m6h-hardening-plan.md): the spool reuses core-storage's SqliteDatabase /
+    // MigrationRunner rather than re-implementing versioned-migration bookkeeping and owner-only
+    // file permissions from scratch. Nothing here is chat-specific -- see this module's own
+    // RelaySpool for what it actually uses.
+    implementation(project(":core-storage"))
     // Used only to peek at a well-formed record's expiresAt field (DiscoveryRegistry never
     // verifies signatures — see that class's javadoc for why that's not this module's job).
     implementation(project(":core-discovery"))

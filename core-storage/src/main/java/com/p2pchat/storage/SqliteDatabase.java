@@ -32,15 +32,36 @@ public final class SqliteDatabase implements AutoCloseable {
      * exist yet, then applies any pending migrations via {@link MigrationRunner}.
      */
     public static SqliteDatabase openOrCreate(Path dataDir) {
+        return openOrCreate(dataDir, "p2p-chat.sqlite", new MigrationRunner());
+    }
+
+    /**
+     * Track A-3 (pre-m6h-hardening-plan.md): lets a caller outside this class's own default
+     * (namely {@code relay-server}'s own spool) open a database under a different filename in
+     * the same data directory, migrated by its own independent {@link MigrationRunner} — reusing
+     * this class's directory creation, owner-only permission pre-creation (pre-m6h-hardening-
+     * plan.md finding C-2), and {@code PRAGMA foreign_keys} setup rather than re-implementing
+     * them. The 1-arg overload above is unchanged behavior, equivalent to calling this one with
+     * {@code "p2p-chat.sqlite"} and {@code new MigrationRunner()}.
+     *
+     * @param fileName        database filename within {@code dataDir}, e.g. {@code
+     *                        "relay-spool.sqlite"} — a distinct name specifically so a caller
+     *                        that also uses the 1-arg overload's default filename in the same
+     *                        directory (unlikely, but not this method's business to prevent)
+     *                        doesn't collide with it
+     * @param migrationRunner the caller's own migration set, applied exactly as {@link
+     *                        MigrationRunner#migrate} already does for the default case
+     */
+    public static SqliteDatabase openOrCreate(Path dataDir, String fileName, MigrationRunner migrationRunner) {
         try {
             Files.createDirectories(dataDir);
-            Path dbFile = dataDir.resolve("p2p-chat.sqlite");
+            Path dbFile = dataDir.resolve(fileName);
             preCreateOwnerOnly(dbFile);
             Connection connection = DriverManager.getConnection("jdbc:sqlite:" + dbFile);
             try (Statement statement = connection.createStatement()) {
                 statement.execute("PRAGMA foreign_keys = ON");
             }
-            new MigrationRunner().migrate(connection);
+            migrationRunner.migrate(connection);
             return new SqliteDatabase(connection);
         } catch (SQLException | IOException e) {
             throw new RuntimeException("Failed to open/migrate SQLite database in " + dataDir, e);
