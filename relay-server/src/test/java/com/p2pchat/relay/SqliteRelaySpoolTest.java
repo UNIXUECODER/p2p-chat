@@ -10,6 +10,7 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CountDownLatch;
@@ -21,14 +22,13 @@ import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /**
- * Track A-3 (pre-m6h-hardening-plan.md), Commit 2: basic enqueue/fetch/delete shape for {@link
- * SqliteRelaySpool}, against a real SQLite file via the same {@link SqliteDatabase} /
- * {@link MigrationRunner} machinery {@code core-storage} itself uses — not a fake, since the
- * whole point of this class existing is the real thing (real file permissions, a real second,
- * independent {@code schema_migrations}-tracked schema, real SQLite concurrency behavior under
- * genuinely simultaneous writers). Quota, TTL, and max-frame-size enforcement are deliberately
- * out of scope here — see {@link RelaySpool}'s own Javadoc for why this commit's shape is
- * enqueue/fetch/delete only.
+ * Track A-3 (pre-m6h-hardening-plan.md), Commits 2 and 3: {@link SqliteRelaySpool}'s full shape
+ * — enqueue/fetch/delete (Commit 2) plus quota, max-frame-size, and TTL enforcement (Commit 3) —
+ * against a real SQLite file via the same {@link SqliteDatabase} / {@link MigrationRunner}
+ * machinery {@code core-storage} itself uses. Not a fake, since the whole point of this class
+ * existing is the real thing (real file permissions, a real second, independent {@code
+ * schema_migrations}-tracked schema, real SQLite concurrency behavior under genuinely
+ * simultaneous writers).
  */
 class SqliteRelaySpoolTest {
 
@@ -50,10 +50,10 @@ class SqliteRelaySpoolTest {
 
     @Test
     void enqueuedMessageIsFetchedBackWithItsSenderAndPayloadIntact() {
-        spool.enqueue("bob", "alice", "hello bob".getBytes(StandardCharsets.UTF_8)).join();
+        EnqueueResult result = spool.enqueue("bob", "alice", "hello bob".getBytes(StandardCharsets.UTF_8)).join();
 
+        assertThat(result).isEqualTo(EnqueueResult.ACCEPTED);
         List<SpooledMessage> forBob = spool.fetchForTarget("bob").join();
-
         assertThat(forBob).hasSize(1);
         assertThat(forBob.get(0).senderPeerId()).isEqualTo("alice");
         assertThat(forBob.get(0).payload()).isEqualTo("hello bob".getBytes(StandardCharsets.UTF_8));
@@ -187,5 +187,129 @@ class SqliteRelaySpoolTest {
         assertThat(m1).isEqualTo(m2);
         assertThat(m1.hashCode()).isEqualTo(m2.hashCode());
         assertThat(m1).isNotEqualTo(m3);
+    }
+
+    @Test
+    void purgeExpiredDoesNothingWhenNothingIsPastTheCutoff() {
+        spool.enqueue("bob", "alice", "fresh".getBytes(StandardCharsets.UTF_8)).join();
+
+        int purged = spool.purgeExpired(Instant.now()).join();
+
+        assertThat(purged).isEqualTo(0);
+        assertThat(spool.fetchForTarget("bob").join()).hasSize(1);
+    }
+
+    @Test
+    void purgeExpiredRemovesOnlyMessagesOlderThanTheCutoffKeepingNewerOnes() throws Exception {
+        spool.enqueue("bob", "alice", "old-message".getBytes(StandardCharsets.UTF_8)).join();
+        Thread.sleep(50);
+        Instant midpoint = Instant.now();
+        Thread.sleep(50);
+        spool.enqueue("bob", "alice", "new-message".getBytes(StandardCharsets.UTF_8)).join();
+
+        // Using the real production DEFAULT_TTL, not an artificially small one -- proves the
+        // actual default works, not just that the cutoff arithmetic works in the abstract.
+        int purged = spool.purgeExpired(midpoint.plus(SqliteRelaySpool.DEFAULT_TTL)).join();
+
+        assertThat(purged).isEqualTo(1);
+        List<SpooledMessage> remaining = spool.fetchForTarget("bob").join();
+        assertThat(remaining).hasSize(1);
+        assertThat(remaining.get(0).payload()).isEqualTo("new-message".getBytes(StandardCharsets.UTF_8));
+    }
+
+    @Test
+    void messageExceedingMaxFrameSizeIsRejectedBeforeTouchingTheDatabase(@TempDir Path isolatedDir) throws Exception {
+        MigrationRunner relayMigrations = new MigrationRunner("/db/relay-migration/", List.of("V001__relay_spool.sql"));
+        try (SqliteDatabase isolatedDb = SqliteDatabase.openOrCreate(isolatedDir, "isolated.sqlite", relayMigrations);
+             SqliteRelaySpool tinySpool = new SqliteRelaySpool(isolatedDb.connection(), SqliteRelaySpool.DEFAULT_TTL,
+                     SqliteRelaySpool.DEFAULT_MAX_MESSAGES_PER_PEER, SqliteRelaySpool.DEFAULT_MAX_BYTES_PER_PEER, 10)) {
+            EnqueueResult result = tinySpool.enqueue("bob", "alice",
+                    "this payload is well over ten bytes long".getBytes(StandardCharsets.UTF_8)).join();
+
+            assertThat(result).isEqualTo(EnqueueResult.REJECTED_MESSAGE_TOO_LARGE);
+            assertThat(tinySpool.fetchForTarget("bob").join()).isEmpty();
+        }
+    }
+
+    @Test
+    void messageCountQuotaRejectsOnceTheLimitIsReached(@TempDir Path isolatedDir) throws Exception {
+        MigrationRunner relayMigrations = new MigrationRunner("/db/relay-migration/", List.of("V001__relay_spool.sql"));
+        try (SqliteDatabase isolatedDb = SqliteDatabase.openOrCreate(isolatedDir, "isolated.sqlite", relayMigrations);
+             SqliteRelaySpool tinySpool = new SqliteRelaySpool(isolatedDb.connection(), SqliteRelaySpool.DEFAULT_TTL,
+                     3, SqliteRelaySpool.DEFAULT_MAX_BYTES_PER_PEER, SqliteRelaySpool.DEFAULT_MAX_FRAME_SIZE_BYTES)) {
+            assertThat(tinySpool.enqueue("bob", "alice", "1".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+            assertThat(tinySpool.enqueue("bob", "alice", "2".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+            assertThat(tinySpool.enqueue("bob", "alice", "3".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+
+            EnqueueResult fourth = tinySpool.enqueue("bob", "alice", "4".getBytes(StandardCharsets.UTF_8)).join();
+
+            assertThat(fourth).isEqualTo(EnqueueResult.REJECTED_QUOTA_EXCEEDED);
+            assertThat(tinySpool.fetchForTarget("bob").join()).hasSize(3);
+        }
+    }
+
+    @Test
+    void messageCountQuotaIsPerTargetNotGlobal(@TempDir Path isolatedDir) throws Exception {
+        // A quota-exhausted target must not block a DIFFERENT target from being spooled -- per-
+        // peer means per-peer, not a shared global counter across the whole relay.
+        MigrationRunner relayMigrations = new MigrationRunner("/db/relay-migration/", List.of("V001__relay_spool.sql"));
+        try (SqliteDatabase isolatedDb = SqliteDatabase.openOrCreate(isolatedDir, "isolated.sqlite", relayMigrations);
+             SqliteRelaySpool tinySpool = new SqliteRelaySpool(isolatedDb.connection(), SqliteRelaySpool.DEFAULT_TTL,
+                     1, SqliteRelaySpool.DEFAULT_MAX_BYTES_PER_PEER, SqliteRelaySpool.DEFAULT_MAX_FRAME_SIZE_BYTES)) {
+            assertThat(tinySpool.enqueue("bob", "alice", "1".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+            assertThat(tinySpool.enqueue("bob", "alice", "2".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.REJECTED_QUOTA_EXCEEDED);
+
+            assertThat(tinySpool.enqueue("dave", "alice", "1".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+        }
+    }
+
+    @Test
+    void byteQuotaRejectsAMessageThatWouldPushTotalOverTheBudget(@TempDir Path isolatedDir) throws Exception {
+        MigrationRunner relayMigrations = new MigrationRunner("/db/relay-migration/", List.of("V001__relay_spool.sql"));
+        try (SqliteDatabase isolatedDb = SqliteDatabase.openOrCreate(isolatedDir, "isolated.sqlite", relayMigrations);
+             SqliteRelaySpool tinySpool = new SqliteRelaySpool(isolatedDb.connection(), SqliteRelaySpool.DEFAULT_TTL,
+                     SqliteRelaySpool.DEFAULT_MAX_MESSAGES_PER_PEER, 10, SqliteRelaySpool.DEFAULT_MAX_FRAME_SIZE_BYTES)) {
+            // 8 bytes fits within a 10-byte budget.
+            assertThat(tinySpool.enqueue("bob", "alice", "12345678".getBytes(StandardCharsets.UTF_8)).join())
+                    .isEqualTo(EnqueueResult.ACCEPTED);
+            // 8 + 5 = 13 > 10 -- rejected, even though the message-count limit isn't close.
+            EnqueueResult second = tinySpool.enqueue("bob", "alice", "56789".getBytes(StandardCharsets.UTF_8)).join();
+
+            assertThat(second).isEqualTo(EnqueueResult.REJECTED_QUOTA_EXCEEDED);
+            assertThat(tinySpool.fetchForTarget("bob").join()).hasSize(1);
+        }
+    }
+
+    @Test
+    void startPeriodicPurgeActuallyRunsOnSchedule(@TempDir Path isolatedDir) throws Exception {
+        MigrationRunner relayMigrations = new MigrationRunner("/db/relay-migration/", List.of("V001__relay_spool.sql"));
+        // A deliberately tiny TTL (not the real 7-day default) so a message enqueued "now" is
+        // already expired by the time the first sweep fires -- this test is about proving the
+        // scheduling itself works, not re-testing purgeExpired's own cutoff logic (already
+        // covered above).
+        try (SqliteDatabase isolatedDb = SqliteDatabase.openOrCreate(isolatedDir, "isolated.sqlite", relayMigrations);
+             SqliteRelaySpool tinySpool = new SqliteRelaySpool(isolatedDb.connection(), Duration.ofMillis(1),
+                     SqliteRelaySpool.DEFAULT_MAX_MESSAGES_PER_PEER, SqliteRelaySpool.DEFAULT_MAX_BYTES_PER_PEER,
+                     SqliteRelaySpool.DEFAULT_MAX_FRAME_SIZE_BYTES)) {
+            tinySpool.enqueue("bob", "alice", "will expire almost immediately".getBytes(StandardCharsets.UTF_8)).join();
+            tinySpool.startPeriodicPurge(Duration.ofMillis(50));
+
+            awaitEmpty(tinySpool, "bob");
+
+            assertThat(tinySpool.fetchForTarget("bob").join()).isEmpty();
+        }
+    }
+
+    private void awaitEmpty(SqliteRelaySpool spool, String target) throws Exception {
+        long deadline = System.currentTimeMillis() + 3000;
+        while (!spool.fetchForTarget(target).join().isEmpty() && System.currentTimeMillis() < deadline) {
+            Thread.sleep(20);
+        }
     }
 }
