@@ -276,6 +276,8 @@ rather than transient. State this in the spec's threat model rather than leaving
 **Done when.** Peer A sends to offline Peer B; B starts an hour later and receives it. Expired
 messages are provably purged. Quota rejection is exercised by a test.
 
+*Status (2026-09-27):* ✅ **Completed & Verified.** Implemented via `RelaySpool` / `SqliteRelaySpool` (thread-confined single-worker DAO, deterministic `purgeExpired`, 7-day TTL, per-peer quotas of 500 messages / 50 MB, 64 KiB frame ceiling), independent `relay-spool.sqlite` schema and migration runner, and wired into `RelayRegistry` (enqueue-on-unregistered with quota rejection handling, disconnect-guarded FIFO drain upon reconnection, startup cold-purge sweep). Unit tests cover all quotas, TTL cutoff boundaries, mid-drain disconnect safety, and FIFO delivery. Empirically verified on real hardware via full 3-process asynchronous lifecycle matrix (`relay-server`, `alice`, `bob`): offline spooling of PQXDH PreKey messages and Signal Double Ratchet frames, reconnection FIFO flush, and full round-trip delivery receipt delivery while the originating sender was offline, with Alice's local SQLite database confirmed flipping from `SENT` to `DELIVERED` and relay spool draining to 0 rows.
+
 ### A-4. Relay configuration & selection
 
 **What.** The daemon needs to *know* its relay. Today relay addresses arrive as CLI args on demo

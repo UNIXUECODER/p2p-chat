@@ -1051,6 +1051,7 @@ M5a through M5e now cover the clock, the wire format, the live send/receive/pers
 - **M6g-6** 🧪 — Track B: protocol versioning (see above). B-1 (version byte, all four codecs), B-2 (capability negotiation handshake, wired into `SessionManager`), B-3 (compatibility-policy ADR, which itself surfaced a real gap between policy and `ApplicationMessageRouter`'s current behavior — tracked in the ADR, not yet fixed). Real, executed `./gradlew test --rerun-tasks` — 383/383 tests passing across all subprojects, 0 failures, 0 errors.
 - **Track A-1** 🧪 — Persistent relay session (see above). `RelaySession`, keepalive PING/PONG, exponential backoff with jitter, `Libp2pNetworkService.connectToRelay` stream-binding bugfix. Real, executed `./gradlew test --rerun-tasks` — 401/401 tests passing, 0 failures, 0 errors, plus verified on real hardware via 3-terminal test matrix (`relay-server`, `client1`, `client2`).
 - **Track A-2** 🧪 — Relay inbound reception & ADR-0001 unknown marker compliance (see above). `handleRelayDeliveredFrame`, `DispatchedMessage.Unknown` (ignore & log), 3-terminal hardware verification with NAT simulation. Real, executed `./gradlew test --rerun-tasks` — 403/403 tests passing across all subprojects, 0 failures, 0 errors.
+- **Track A-3** 🧪 — Relay store-and-forward spool (see below). Thread-confined `RelaySpool` / `SqliteRelaySpool`, independent `relay-spool.sqlite` schema and migration runner, deterministic `purgeExpired`, 7-day TTL, per-peer quotas (500 messages / 50 MB), 64 KiB ceiling, disconnect-guarded drain, startup purge sweep. Real, executed `./gradlew test` — 427/427 tests passing across all subprojects, 0 failures, 0 errors, plus verified on real hardware via full 3-process asynchronous lifecycle matrix (`relay-server`, `alice`, `bob`) with offline message spooling, post-reconnect FIFO drain, and complete round-trip delivery receipt delivery while the sender was offline (Alice's DB confirmed flipping to `DELIVERED`).
 
 ---
 
@@ -1069,6 +1070,29 @@ Resolves audit finding A-2 (and ADR-0001 follow-up) from `docs/pre-m6h-hardening
 
 ---
 
+## Track A-3 — Relay store-and-forward spool 🧪 Tested (hardware run) (see [`docs/verification-vocabulary.md`](docs/verification-vocabulary.md)) — real, executed `./gradlew test`, 427/427 tests passing across 51 executed tasks, 0 failures, 0 errors, plus verified on real hardware via 3-process asynchronous lifecycle matrix
+
+Resolves audit finding A-3 from `docs/pre-m6h-hardening-plan.md`, promoting the relay store-and-forward capability from *Post-M6* to M6h. Transforms the relay transport from an intercom requiring simultaneous presence into a true asynchronous messenger.
+
+- **Independent SQLite Spool Schema (`relay-spool.sqlite`):** Parameterized `MigrationRunner` in `core-storage` to execute migrations against arbitrary resource roots. Added `V001__relay_spool.sql` creating `spooled_messages` (`id`, `target_peer_id`, `sender_peer_id`, `payload`, `enqueued_at`) and `idx_spooled_messages_target`.
+- **Thread-Confined DAO (`SqliteRelaySpool`):** Confined all JDBC interactions to a dedicated single-threaded executor (`relay-spool`), returning non-blocking `CompletableFuture`s and ensuring serialized SQLite access with graceful shutdown.
+- **Quotas, TTL Enforcement & Deterministic Purge:** Implemented per-peer quotas (capped at 500 messages and 50 MB using SQLite `COUNT` and `SUM(LENGTH)` queries), 64 KiB frame size ceiling with synchronous fast-rejection, deterministic `purgeExpired(Instant now)` for boundary testing, and periodic purge sweeps (`startPeriodicPurge`).
+- **`RelayRegistry` Store-and-Forward Wiring:** In `onFrame`, unregistered target peers trigger `spool.enqueue(...)` instead of dropping frames. In `onConnected`, `drainSpooledMessages` fetches queued messages in FIFO order and delivers them over the stream.
+- **Mid-Drain Disconnect Guard & Cold-Startup Purge:** In `drainSpooledMessages`, every iteration asserts `registered.get(targetPeerId) == controller`; if the recipient disconnects mid-drain, flushing aborts immediately to prevent deleting undelivered messages from SQLite. In `RelayServerMain`, an immediate asynchronous purge sweep is executed on boot to clear stale backlog from downtime before starting the periodic hourly sweep.
+- **Hardware verification (3-process asynchronous lifecycle matrix):**
+  1. *Relay Server (`RelayServerMain`)*: Listening on port 9100 with persistent `relay-spool.sqlite`.
+  2. *Bob (`SessionManagerListenerMain`)*: Started once to generate keys and publish PreKey bundle, then shut down completely (going offline).
+  3. *Alice (`SessionManagerSenderMain`)*: Direct port to Bob set to unreachable (port 9999). Alice sends encrypted PQXDH / Double Ratchet message through the relay (`Send resolved: RELAYED`). Relay detects Bob is offline and spools both Handshake Init (`1865 bytes`) and Chat message (`2138 bytes`) in `relay-spool.sqlite`. Alice's local database records `SENT`. Alice shuts down (offline).
+  4. *Bob Reconnects*: Bob starts up. Relay detects registration and drains both spooled messages in FIFO order (`delivered 2 spooled message(s)`). Bob decrypts the message and logs `[event] message.received`. Bob automatically generates a delivery receipt and handshake response back to Alice; because Alice is now offline, Relay spools both frames for Alice in `relay-spool.sqlite`.
+  5. *Alice Reconnects & Receives Spooled Receipt*: Alice starts `SessionManagerListenerMain` on port 9301. Relay detects Alice and drains Bob's spooled delivery receipt to Alice. Alice decrypts the receipt and fires `[event] delivery.changed messageId=... state=DELIVERED`. Alice's local database was inspected via `sqlite3` and confirmed flipped from `SENT` to `DELIVERED`. Relay spool count confirmed drained to 0.
+- **Arithmetic:** 24 new unit tests over the 403-test Track A-2 baseline:
+  - Commit 1 (`c944791`): `MigrationRunnerTest` (+3 tests) = 406
+  - Commit 2 (`26d43ad`): `SqliteRelaySpoolTest` (+10 tests) = 416
+  - Commit 3 (`6f3e3cc`): `SqliteRelaySpoolTest` (+7 quota/TTL/purge tests) = 423
+  - Commit 4 (Working tree): `RelayRegistryTest` (+4 tests) = 427 tests passing, 0 failures, 0 errors, 4 skipped (Windows POSIX permission tests).
+
+---
+
 ## Next milestone
 
-Then **Track A-3** (relay store-and-forward spool) and **Track A-4** (relay configuration) precede **M6h** (`DaemonMain`, the composition root + E2E test). Real external/public address discovery remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. See `docs/pre-m6h-hardening-plan.md`.
+Then **Track A-4** (relay configuration) precedes **M6h** (`DaemonMain`, the composition root + E2E test). Real external/public address discovery remains fully unbuilt and is M7's problem, not resolved by `DialableAddressResolver`'s LAN scope. See `docs/pre-m6h-hardening-plan.md`.
