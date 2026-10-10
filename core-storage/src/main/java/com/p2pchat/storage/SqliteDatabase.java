@@ -11,17 +11,38 @@ import java.sql.DriverManager;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.Supplier;
 
 /**
  * Opens (creating and migrating if needed) the SQLite database for a data directory, matching
  * the same "one file per data dir" convention core-identity and core-crypto's key vaults
  * already use. A single, long-lived {@link Connection} is held and reused for the process's
- * lifetime — SQLite itself serializes writers internally, and nothing in this project yet needs
- * a connection pool.
+ * lifetime, and nothing in this project yet needs a connection pool.
+ *
+ * <p><b>Threading (pre-m6h-hardening-plan.md F-1).</b> A JDBC {@code Connection} is not a safe
+ * place for several threads to interleave statements and transactions: a second thread's plain
+ * write lands inside a first thread's open transaction and is rolled back with it, and two
+ * overlapping {@code setAutoCommit} toggles can leave auto-commit stuck off. So this class owns
+ * one re-entrant lock covering every use of the connection. Callers take a {@link #lease()} for
+ * statement execution and use {@link #inTransaction} for transactions, which holds the lock from
+ * the first statement to the commit.
+ *
+ * <p><b>Lock order</b> (hardening plan R-1), outermost first: the per-peer crypto lock (F-2, not
+ * yet implemented), then {@code SynchronizedSignalProtocolStore}'s monitor, then this lock. Never acquire them in the
+ * other direction, and never call the network, an event listener, or any other blocking
+ * operation while holding a lease or inside a transaction body.
  */
 public final class SqliteDatabase implements AutoCloseable {
 
     private final Connection connection;
+    private final ReentrantLock lock = new ReentrantLock();
+
+    /** Nesting depth of {@link #inTransaction}; only ever touched by the thread holding {@link #lock}. */
+    private int transactionDepth;
+
+    /** Set when a nested transaction body failed, so the outermost one refuses to commit. Guarded by {@link #lock}. */
+    private boolean rollbackOnly;
 
     private SqliteDatabase(Connection connection) {
         this.connection = connection;
@@ -103,13 +124,150 @@ public final class SqliteDatabase implements AutoCloseable {
         Files.createFile(dbFile, attr);
     }
 
-    /** The live connection backing this database. Callers must not close it directly — use {@link #close()}. */
+    /**
+     * The live connection backing this database. <b>Not safe to use from several threads on its
+     * own</b> — take a {@link #lease()} for any statement execution and use
+     * {@link #inTransaction} for a transaction. Retained for single-threaded setup code and tests.
+     * Callers must not close it directly — use {@link #close()}.
+     */
     public Connection connection() {
         return connection;
     }
 
+    /**
+     * Acquires this database's lock and returns a handle to the connection that releases it on
+     * {@link Lease#close()}. Use in a try-with-resources <em>ahead of</em> the statement, so the
+     * lock outlives the statement's execution and result-set iteration:
+     *
+     * <pre>{@code
+     * try (SqliteDatabase.Lease lease = database.lease();
+     *      PreparedStatement statement = lease.connection().prepareStatement(sql)) {
+     *     ...
+     * }
+     * }</pre>
+     *
+     * Re-entrant: a thread that already holds the lock (including from inside {@link
+     * #inTransaction}) may take further leases. A thread that does not hold it blocks until the
+     * current holder — including an open transaction — finishes, which is exactly what keeps
+     * another thread's write out of that transaction.
+     */
+    public Lease lease() {
+        lock.lock();
+        return new Lease();
+    }
+
+    /**
+     * Runs {@code work} in a transaction, holding the database lock from the first statement to
+     * the commit (or rollback). Re-entrant: a call made while this thread is already inside a
+     * transaction <em>joins</em> it — it neither commits early nor starts a second transaction. If
+     * a joined (nested) body throws, the outermost transaction is marked rollback-only: even if
+     * the outer body swallows the exception, the outermost call rolls everything back and throws
+     * {@link IllegalStateException} instead of committing partial work.
+     *
+     * <p>Auto-commit is always restored to {@code true} afterwards, whatever happened. {@link
+     * Error}s roll back too (previously only {@link RuntimeException} did, and restoring
+     * auto-commit with a transaction still pending would have committed it).
+     *
+     * @throws RuntimeException the body's own exception, unchanged; or {@code "Transaction failed"}
+     *                          wrapping an {@link SQLException} from begin/commit/rollback
+     */
+    public <T> T inTransaction(Supplier<T> work) {
+        lock.lock();
+        try {
+            if (transactionDepth > 0) {
+                transactionDepth++;
+                try {
+                    return work.get();
+                } catch (RuntimeException | Error e) {
+                    rollbackOnly = true;
+                    throw e;
+                } finally {
+                    transactionDepth--;
+                }
+            }
+            return runOutermostTransaction(work);
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    private <T> T runOutermostTransaction(Supplier<T> work) {
+        T result = null;
+        Throwable failure = null;
+        try {
+            connection.setAutoCommit(false);
+            transactionDepth = 1;
+            rollbackOnly = false;
+            result = work.get();
+            if (rollbackOnly) {
+                throw new IllegalStateException(
+                        "Transaction rolled back: a nested transaction failed and its exception was swallowed");
+            }
+            connection.commit();
+        } catch (Throwable t) {
+            failure = t;
+            try {
+                connection.rollback();
+            } catch (SQLException rollbackFailure) {
+                t.addSuppressed(rollbackFailure);
+            }
+        } finally {
+            transactionDepth = 0;
+            rollbackOnly = false;
+        }
+        try {
+            connection.setAutoCommit(true);
+        } catch (SQLException e) {
+            if (failure != null) {
+                failure.addSuppressed(e);
+            } else {
+                failure = new RuntimeException("Failed to restore auto-commit after transaction", e);
+            }
+        }
+        if (failure == null) {
+            return result;
+        }
+        if (failure instanceof RuntimeException runtimeFailure) {
+            throw runtimeFailure;
+        }
+        if (failure instanceof Error errorFailure) {
+            throw errorFailure;
+        }
+        throw new RuntimeException("Transaction failed", failure);
+    }
+
     @Override
     public void close() throws SQLException {
-        connection.close();
+        lock.lock();
+        try {
+            connection.close();
+        } finally {
+            lock.unlock();
+        }
+    }
+
+    /** A held lock on this database plus access to its connection; see {@link #lease()}. */
+    public final class Lease implements AutoCloseable {
+        private boolean open = true;
+
+        private Lease() {
+        }
+
+        /** The connection, valid until this lease is closed. */
+        public Connection connection() {
+            if (!open) {
+                throw new IllegalStateException("Lease already released");
+            }
+            return connection;
+        }
+
+        /** Releases the lock. Idempotent; must be called by the thread that took the lease. */
+        @Override
+        public void close() {
+            if (open) {
+                open = false;
+                lock.unlock();
+            }
+        }
     }
 }

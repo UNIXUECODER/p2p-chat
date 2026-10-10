@@ -13,7 +13,6 @@ import com.p2pchat.storage.model.PeerRoute;
 import com.p2pchat.storage.model.TransferState;
 
 import java.nio.charset.StandardCharsets;
-import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -70,7 +69,8 @@ public final class SqliteStorageService implements StorageService {
                   "ORDER BY hlc_timestamp ASC LIMIT ?";
 
         List<Message> results = new ArrayList<>();
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, conversationId);
             if (hasCursor) {
                 statement.setString(2, cursor);
@@ -136,7 +136,8 @@ public final class SqliteStorageService implements StorageService {
     @Override
     public TransferState getTransferState(String transferId) {
         String sql = "SELECT state FROM file_transfers WHERE transfer_id = ?";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, transferId);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? TransferState.valueOf(resultSet.getString("state")) : null;
@@ -189,7 +190,8 @@ public final class SqliteStorageService implements StorageService {
     public List<Integer> missingChunks(String transferId, int totalChunks) {
         Set<Integer> received = new HashSet<>();
         String sql = "SELECT chunk_index FROM file_chunk_state WHERE transfer_id = ? AND received = 1";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, transferId);
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
@@ -212,7 +214,8 @@ public final class SqliteStorageService implements StorageService {
     @Override
     public boolean hasMessage(String messageId) {
         String sql = "SELECT 1 FROM messages WHERE message_id = ? LIMIT 1";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, messageId);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next();
@@ -251,7 +254,8 @@ public final class SqliteStorageService implements StorageService {
     @Override
     public List<Conversation> listConversations() {
         List<Conversation> conversations = new ArrayList<>();
-        try (PreparedStatement statement = database.connection().prepareStatement(
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(
                 "SELECT conversation_id, type, name, created_at FROM conversations")) {
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
@@ -267,7 +271,8 @@ public final class SqliteStorageService implements StorageService {
         // as missingChunks' own single received-set query below. A conversation absent from this
         // map has no messages yet.
         Map<String, String> latestHlcByConversation = new HashMap<>();
-        try (PreparedStatement statement = database.connection().prepareStatement(
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(
                 "SELECT conversation_id, MAX(hlc_timestamp) AS latest FROM messages GROUP BY conversation_id")) {
             try (ResultSet resultSet = statement.executeQuery()) {
                 while (resultSet.next()) {
@@ -311,7 +316,8 @@ public final class SqliteStorageService implements StorageService {
         List<Contact> results = new ArrayList<>();
         String sql = "SELECT peer_id, display_name, verified, added_at FROM contacts " +
                 "ORDER BY display_name COLLATE NOCASE ASC, peer_id ASC";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql);
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql);
              ResultSet resultSet = statement.executeQuery()) {
             while (resultSet.next()) {
                 results.add(mapContact(resultSet));
@@ -325,7 +331,8 @@ public final class SqliteStorageService implements StorageService {
     @Override
     public Conversation getConversation(String conversationId) {
         String sql = "SELECT conversation_id, type, name, created_at FROM conversations WHERE conversation_id = ?";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, conversationId);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? mapConversation(resultSet) : null;
@@ -338,7 +345,8 @@ public final class SqliteStorageService implements StorageService {
     @Override
     public Contact getContact(PeerId peerId) {
         String sql = "SELECT peer_id, display_name, verified, added_at FROM contacts WHERE peer_id = ?";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, peerId.value());
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? mapContact(resultSet) : null;
@@ -382,7 +390,8 @@ public final class SqliteStorageService implements StorageService {
                 "display_name = COALESCE(excluded.display_name, peer_routes.display_name), " +
                 "pre_key_bundle = COALESCE(excluded.pre_key_bundle, peer_routes.pre_key_bundle), " +
                 "last_seen = excluded.last_seen";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, observed.peerId().value());
             statement.setString(2, observed.directMultiaddr());
             statement.setString(3, observed.relayMultiaddr());
@@ -410,7 +419,8 @@ public final class SqliteStorageService implements StorageService {
     public PeerRoute getPeerRoute(PeerId peerId) {
         String sql = "SELECT peer_id, direct_multiaddr, relay_multiaddr, display_name, pre_key_bundle, last_seen " +
                 "FROM peer_routes WHERE peer_id = ?";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, peerId.value());
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next() ? mapPeerRoute(resultSet) : null;
@@ -425,7 +435,8 @@ public final class SqliteStorageService implements StorageService {
         List<PeerRoute> results = new ArrayList<>();
         String sql = "SELECT peer_id, direct_multiaddr, relay_multiaddr, display_name, pre_key_bundle, last_seen " +
                 "FROM peer_routes ORDER BY last_seen DESC";
-        try (PreparedStatement statement = database.connection().prepareStatement(sql);
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql);
              ResultSet resultSet = statement.executeQuery()) {
             while (resultSet.next()) {
                 results.add(mapPeerRoute(resultSet));
@@ -447,25 +458,14 @@ public final class SqliteStorageService implements StorageService {
         );
     }
 
+    /**
+     * Delegates to {@link SqliteDatabase#inTransaction}, which owns the transaction state (and
+     * the database lock) because it belongs to the connection, not to any one service instance
+     * (hardening plan F-1). Re-entrant: a nested call joins the enclosing transaction.
+     */
     @Override
     public <T> T runInTransaction(Supplier<T> work) {
-        Connection connection = database.connection();
-        try {
-            boolean previousAutoCommit = connection.getAutoCommit();
-            connection.setAutoCommit(false);
-            try {
-                T result = work.get();
-                connection.commit();
-                return result;
-            } catch (RuntimeException e) {
-                connection.rollback();
-                throw e;
-            } finally {
-                connection.setAutoCommit(previousAutoCommit);
-            }
-        } catch (SQLException e) {
-            throw new RuntimeException("Transaction failed", e);
-        }
+        return database.inTransaction(work);
     }
 
     private Message mapMessage(ResultSet resultSet) throws SQLException {
@@ -494,7 +494,8 @@ public final class SqliteStorageService implements StorageService {
     }
 
     private void runUpdate(String sql, StatementBinder binder) {
-        try (PreparedStatement statement = database.connection().prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             binder.bind(statement);
             statement.executeUpdate();
         } catch (SQLException e) {

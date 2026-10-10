@@ -18,7 +18,6 @@ import org.signal.libsignal.protocol.state.SessionRecord;
 import org.signal.libsignal.protocol.state.SignalProtocolStore;
 import org.signal.libsignal.protocol.state.SignedPreKeyRecord;
 
-import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -75,21 +74,25 @@ import java.util.UUID;
  * messaging, M8's concern) — if a future real build reports a mismatch, it is most likely here;
  * nothing else in this class depends on that being exactly right.
  *
- * <p><b>Thread safety:</b> none, deliberately — see {@link SynchronizedSignalProtocolStore},
- * which wraps any {@code SignalProtocolStore} (this one included) with the actual guarantee M6e
- * needs for concurrent peer sessions. Keeping that orthogonal here means this class's own
- * correctness (the part that matters most and is hardest to verify) isn't tangled up with
- * locking.
+ * <p><b>Thread safety:</b> two separate concerns, kept apart. <em>Ratchet-state</em> safety is
+ * none here, deliberately — see {@link SynchronizedSignalProtocolStore}, which wraps any {@code
+ * SignalProtocolStore} (this one included) with the guarantee M6e needs for concurrent peer
+ * sessions, and (once F-2 lands) a per-peer crypto lock that makes a whole encrypt/decrypt atomic. <em>Connection</em>
+ * safety is here: every statement runs under a {@link SqliteDatabase#lease()} on the one
+ * connection this store shares with {@code SqliteStorageService} (hardening plan F-1), so a
+ * session write can neither land inside another thread's storage transaction nor be committed or
+ * rolled back with it. Lock order is the (future) crypto lock, then the synchronized-store monitor,
+ * then the database lock (R-1).
  */
 public final class SqliteSignalProtocolStore implements SignalProtocolStore {
 
-    private final Connection connection;
+    private final SqliteDatabase database;
     private final IdentityKeyPair localIdentityKeyPair;
     private final int localRegistrationId;
 
     public SqliteSignalProtocolStore(SqliteDatabase database, IdentityKeyPair localIdentityKeyPair,
                                       int localRegistrationId) {
-        this.connection = database.connection();
+        this.database = database;
         this.localIdentityKeyPair = localIdentityKeyPair;
         this.localRegistrationId = localRegistrationId;
     }
@@ -290,7 +293,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private boolean baseKeySeen(int kyberPreKeyId, int signedPreKeyId, byte[] baseKeyBytes) {
-        try (PreparedStatement statement = connection.prepareStatement(
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(
                 "SELECT 1 FROM signal_kyber_base_keys_seen " +
                         "WHERE kyber_prekey_id = ? AND signed_prekey_id = ? AND base_key = ?")) {
             statement.setInt(1, kyberPreKeyId);
@@ -336,7 +340,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     @Override
     public List<Integer> getSubDeviceSessions(String name) {
         List<Integer> deviceIds = new ArrayList<>();
-        try (PreparedStatement statement = connection.prepareStatement(
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(
                 "SELECT address FROM signal_sessions WHERE address LIKE ?")) {
             statement.setString(1, name + ".%");
             try (ResultSet resultSet = statement.executeQuery()) {
@@ -409,7 +414,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private <T> T querySingle(String sql, String key, RecordDeserializer<T> deserializer) {
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, key);
             return extractSingle(statement, deserializer);
         } catch (SQLException e) {
@@ -418,7 +424,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private <T> T querySingle(String sql, int key, RecordDeserializer<T> deserializer) {
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setInt(1, key);
             return extractSingle(statement, deserializer);
         } catch (SQLException e) {
@@ -442,7 +449,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
 
     private <T> List<T> queryList(String sql, RecordDeserializer<T> deserializer) {
         List<T> results = new ArrayList<>();
-        try (PreparedStatement statement = connection.prepareStatement(sql);
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql);
              ResultSet resultSet = statement.executeQuery()) {
             while (resultSet.next()) {
                 try {
@@ -458,7 +466,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private boolean exists(String sql, String key) {
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setString(1, key);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next();
@@ -469,7 +478,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private boolean exists(String sql, int key) {
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             statement.setInt(1, key);
             try (ResultSet resultSet = statement.executeQuery()) {
                 return resultSet.next();
@@ -484,7 +494,8 @@ public final class SqliteSignalProtocolStore implements SignalProtocolStore {
     }
 
     private void runUpdate(String sql, StatementBinder binder) {
-        try (PreparedStatement statement = connection.prepareStatement(sql)) {
+        try (SqliteDatabase.Lease lease = database.lease();
+             PreparedStatement statement = lease.connection().prepareStatement(sql)) {
             binder.bind(statement);
             statement.executeUpdate();
         } catch (SQLException e) {

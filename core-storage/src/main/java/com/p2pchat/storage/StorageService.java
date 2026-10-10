@@ -221,6 +221,14 @@ public interface StorageService {
     /** M6g-2: every known peer route, most-recently-observed first. */
     List<PeerRoute> listPeerRoutes();
 
-    /** Runs {@code work} inside a single SQLite transaction, committing on normal return and rolling back if {@code work} throws. */
+    /**
+     * Runs {@code work} inside a single SQLite transaction, committing on normal return and rolling
+     * back if {@code work} throws. The database lock is held for the whole transaction, so other
+     * threads' reads and writes wait for it rather than landing inside it. Re-entrant: a nested call
+     * joins the enclosing transaction (no early commit); if a nested body throws, the outermost
+     * call rolls everything back even when the outer body swallows the exception, and throws
+     * {@link IllegalStateException}. The body must call storage only — never crypto, the network,
+     * or an event listener (hardening plan R-1).
+     */
     <T> T runInTransaction(Supplier<T> work);
 }
